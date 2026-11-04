@@ -28,6 +28,21 @@ from disk_explorer.models.scan_result import DirectoryListing, ScanResult
 UpdateCallback = Callable[[FileEntry, ScanResult], Awaitable[None] | None]
 
 
+def display_size(result: ScanResult) -> int | None:
+    """Bytes to show for a size result, or ``None`` when the size is unknown.
+
+    A complete scan always has a trustworthy total, including a legitimate 0.
+    A partial scan only has a lower bound: show it when anything was measured,
+    otherwise the size is genuinely unknown and must stay ``None`` rather than
+    becoming a misleading "0 B".
+    """
+    if result.is_complete:
+        return result.total_size
+    if result.total_size or result.scanned_entries:
+        return result.total_size
+    return None
+
+
 class ScanService:
     """Run filesystem work off the UI loop with bounded worker concurrency."""
 
@@ -135,8 +150,12 @@ class ScanService:
                 assert self.cache is not None
                 cached = await self._run(self.cache.cached_size, entry.path, cross_check_children=True)
                 if cached is not None:
-                    entry.size = cached.total_size if cached.is_complete or cached.scanned_entries else None
-                    entry.scan_status = ScanStatus.CACHED
+                    entry.size = display_size(cached)
+                    # A cached partial total keeps its partial label: the cache
+                    # changes where the number came from, not how complete it is.
+                    entry.scan_status = (
+                        ScanStatus.CACHED if cached.is_complete else ScanStatus.CACHED_PARTIAL
+                    )
                     if on_update is not None:
                         callback_result = on_update(entry, cached)
                         if callback_result is not None:
@@ -147,7 +166,7 @@ class ScanService:
             entry.scan_status = ScanStatus.SCANNING
             try:
                 result = await self._run(self.scanner.calculate_size, entry.path, cancellation)
-                entry.size = result.total_size if result.is_complete or result.scanned_entries else None
+                entry.size = display_size(result)
                 entry.scan_status = ScanStatus.COMPLETE if result.is_complete else ScanStatus.PARTIAL
                 if self.cache_enabled and not result.cancelled:
                     assert self.cache is not None

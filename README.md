@@ -155,10 +155,18 @@ the same scan — a directory's own mtime cannot see changes deeper in the tree,
 which is exactly why the TTL exists. Full column reference and failure matrix:
 [docs/cache-schema.md](docs/cache-schema.md).
 
-**What is never cached.** Only complete, error-free scans are stored. Cancelled or
-partial scans and permission errors are skipped, so a cache hit can never
-resurrect a partial result as a success, and an unreadable folder is never cached
-as empty.
+**Cached data carries its own truth.** Every size row stores `is_complete` and its
+error list, so a partial total comes back as `is_complete=False` and is labelled
+`Cached·part` in the table instead of being presented as a complete size.
+
+- Directory *listings* stay strict: a partial listing would silently hide
+  children, and a miss costs one `scandir`.
+- Recursive *sizes* may be partial, because that is the expensive case — a 2.2 s
+  walk over a 411k-entry tree where two protected folders make the result
+  partial. It is cached only together with its error list; a "partial" result
+  with no explanation, or a cancelled walk, is never stored.
+- An unreadable folder is never cached as a complete empty scan, and a partial
+  scan that measured nothing shows `—` (unknown), never `0 B`.
 
 **Refresh means refresh.** `r` (or the Refresh button) drops the cached rows for
 the current folder and rescans. Startup housekeeping prunes rows past their TTL.
@@ -173,6 +181,10 @@ is readable, which needs a directory the app can `stat`. Network shares with
 unreliable timestamps will mostly cache-miss rather than serve stale data — an
 intentional trade.
 
+Schema history: v1 stored complete scans only; v2 adds `is_complete` and `errors`
+to `sizes` so partial totals can be cached and labelled. Upgrading is automatic
+and keeps existing rows ([docs/cache-schema.md](docs/cache-schema.md#migrations)).
+
 ### Measured behaviour
 
 `scripts/benchmark_cache.py` reports medians for this machine and filesystem;
@@ -181,22 +193,28 @@ as general speedups. On the development sandbox (Linux, Python engine, warm cach
 
 | Workload | Fresh | Cache hit | Notes |
 | --- | --- | --- | --- |
-| Enumerate `/usr/share` | 0.42 ms | 0.22 ms | 63 direct children |
-| Large directory (2,000 entries, synthetic) | 9.05 ms | 3.78 ms | ~1.9 µs per entry to decode |
-| Recursive size of `/usr/share` | 40.34 ms | 1.30 ms | 4,872 entries; the case caching targets |
-| Invalidate + refresh `/usr/share` | — | 0.58 ms | miss + scan + store |
+| Recursive size, 1,200-file synthetic tree (Python engine) | 6.22 ms | 0.05 ms | the case caching targets |
+| Large directory, 1,200 direct children | 8.47 ms | 4.14 ms | ~3 µs per entry to decode |
+| Directory enumeration, 5 entries | 0.07 ms | 0.09 ms | **slower than the syscall** |
+| Manual refresh (invalidate + scan + store) | — | 0.18 ms | one `scandir` plus a commit |
 
 Reproduce on Windows with your own folders:
 
 ```powershell
 py scripts/benchmark_cache.py --synthetic --entries 2000 --dirs 4 --repeats 5
 py scripts/benchmark_cache.py --path $HOME\Downloads --repeats 3
+py scripts/benchmark_cache.py --synthetic --entries 500 --dirs 2 --unreadable   # partial-result path
 ```
 
-The honest summary: the cache buys very little for a single small local
-`scandir` (fractions of a millisecond, sometimes slower than the syscall), and a
-lot for recursive sizes and antivirus-scanned or network storage. It is not a
-substitute for the Rust engine on enumeration cost.
+The harness refuses to report a speedup for a lookup that returned nothing: an
+uncacheable scan prints `NOT CACHED (reason)`, and each measured scan prints its
+file/directory/skip/error counts so a partial result is visible rather than
+inferred.
+
+The honest summary: the cache buys nothing for a single small local `scandir`
+(fractions of a millisecond — sometimes *slower* than the syscall, as the table
+shows), and a lot for recursive sizes and antivirus-scanned or network storage. It
+is not a substitute for the Rust engine on enumeration cost.
 
 ## Engine contract
 

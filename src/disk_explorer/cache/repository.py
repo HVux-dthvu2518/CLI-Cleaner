@@ -39,6 +39,7 @@ class SizeRecord:
     created_at: float
     mtime_ns: int | None
     ttl_seconds: float
+    is_complete: bool = True
 
 
 def path_key(path: str | Path) -> str:
@@ -249,8 +250,16 @@ class CacheRepository:
 
     # -- recursive sizes ---------------------------------------------------
     def store_size(self, result: ScanResult) -> bool:
-        """Store a recursive size result only when it is trustworthy."""
-        if not result.is_complete or result.cancelled or result.errors:
+        """Store a recursive size result, including a *labelled* partial one.
+
+        A partial total is stored with ``is_complete=0`` and its error list, so a
+        reader can never mistake it for a complete scan. What is never stored is a
+        result the walker abandoned (cancelled), or a "partial" result that carries
+        no explanation - that would be an unaccountable number.
+        """
+        if result.cancelled:
+            return False
+        if not result.is_complete and not result.errors:
             return False
         root_mtime = mtime_ns(result.root)
         if root_mtime is None:
@@ -261,8 +270,9 @@ class CacheRepository:
                     """
                     INSERT INTO sizes
                         (path_key, path, created_at, ttl_seconds, mtime_ns, total_size,
-                         total_files, total_directories, scanned_entries, skipped_count, skipped)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         total_files, total_directories, scanned_entries, skipped_count, skipped,
+                         is_complete, errors)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(path_key) DO UPDATE SET
                         path=excluded.path,
                         created_at=excluded.created_at,
@@ -273,7 +283,9 @@ class CacheRepository:
                         total_directories=excluded.total_directories,
                         scanned_entries=excluded.scanned_entries,
                         skipped_count=excluded.skipped_count,
-                        skipped=excluded.skipped
+                        skipped=excluded.skipped,
+                        is_complete=excluded.is_complete,
+                        errors=excluded.errors
                     """,
                     (
                         path_key(result.root),
@@ -287,6 +299,8 @@ class CacheRepository:
                         result.scanned_entries,
                         result.skipped_entries,
                         _skip_payload(result.skipped_details),
+                        1 if result.is_complete else 0,
+                        json.dumps(result.errors),
                     ),
                 )
             return True
@@ -310,7 +324,8 @@ class CacheRepository:
             row = self.database.fetch_one(
                 """
                 SELECT created_at, ttl_seconds, mtime_ns, total_size, total_files,
-                       total_directories, scanned_entries, skipped_count, skipped
+                       total_directories, scanned_entries, skipped_count, skipped,
+                       is_complete, errors
                 FROM sizes WHERE path_key = ?
                 """,
                 (path_key(root),),
@@ -330,6 +345,8 @@ class CacheRepository:
             scanned_entries,
             skipped_count,
             skipped,
+            is_complete,
+            errors,
         ) = row
         validation = policy.validate(
             created_at=created_at,
@@ -341,6 +358,11 @@ class CacheRepository:
         )
         if not validation.is_valid:
             return None, validation
+        try:
+            stored_errors = [str(line) for line in json.loads(errors or "[]")]
+        except (ValueError, TypeError):
+            stored_errors = ["cached error list was unreadable"]
+        complete = bool(is_complete) and not stored_errors
         result = ScanResult(
             root=root,
             total_size=int(total_size),
@@ -348,8 +370,8 @@ class CacheRepository:
             total_directories=int(total_directories),
             scanned_entries=int(scanned_entries),
             skipped_entries=int(skipped_count),
-            errors=[],
-            is_complete=True,
+            errors=stored_errors,
+            is_complete=complete,
             cancelled=False,
             skipped_details=_skip_details(skipped),
         )
@@ -360,19 +382,27 @@ class CacheRepository:
                 created_at=created_at,
                 mtime_ns=stored_mtime,
                 ttl_seconds=float(row_ttl or 0.0),
+                is_complete=complete,
             ),
             validation,
         )
 
     # -- invalidation ------------------------------------------------------
-    def invalidate(self, path: str | Path, *, include_sizes: bool = True) -> int:
+    def invalidate(
+        self,
+        path: str | Path,
+        *,
+        include_sizes: bool = True,
+        include_listings: bool = True,
+    ) -> int:
         """Drop cached data for one path. Returns the number of removed rows."""
         removed = 0
         try:
             with self.database.transaction(write=True) as connection:
-                removed += connection.execute(
-                    "DELETE FROM listings WHERE path_key = ?", (path_key(path),)
-                ).rowcount
+                if include_listings:
+                    removed += connection.execute(
+                        "DELETE FROM listings WHERE path_key = ?", (path_key(path),)
+                    ).rowcount
                 if include_sizes:
                     removed += connection.execute(
                         "DELETE FROM sizes WHERE path_key = ?", (path_key(path),)

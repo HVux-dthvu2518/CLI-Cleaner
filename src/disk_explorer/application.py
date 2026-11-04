@@ -25,13 +25,29 @@ from disk_explorer.config import (
 )
 from disk_explorer.core.scanner import FileSystemScanner
 from disk_explorer.infrastructure.logging import configure_logging
-from disk_explorer.models.file_entry import FileEntry
+from disk_explorer.models.file_entry import FileEntry, ScanStatus
 from disk_explorer.models.scan_result import ScanResult, SkippedEntry
 from disk_explorer.models.skip_reason import SKIP_REASON_DETAIL, SkipReason
 from disk_explorer.services.scan_service import ScanService
 from disk_explorer.services.screenshot_service import save_screenshot
 from disk_explorer.ui.screens.settings_screen import SettingsScreen
 from disk_explorer.ui.screens.skipped_entries_screen import SkippedEntriesScreen
+
+
+#: Short, unambiguous table labels for scan states.
+_STATUS_LABELS = {
+    ScanStatus.PENDING: "Pending",
+    ScanStatus.SCANNING: "Scanning",
+    ScanStatus.COMPLETE: "Complete",
+    ScanStatus.PARTIAL: "Partial",
+    ScanStatus.ERROR: "Error",
+    ScanStatus.CACHED: "Cached",
+    ScanStatus.CACHED_PARTIAL: "Cached·part",
+}
+
+
+def _status_label(status: ScanStatus) -> str:
+    return _STATUS_LABELS.get(status, status.value.title())
 
 
 def _format_size(size: int | None) -> str:
@@ -440,7 +456,7 @@ class DiskExplorerApp(App[None]):
         for key, (entry, _result) in self._pending_size_updates.items():
             if key in self._entries_by_path:
                 table.update_cell(key, "size", _format_size(entry.size))
-                table.update_cell(key, "scan-status", entry.scan_status.value.title())
+                table.update_cell(key, "scan-status", _status_label(entry.scan_status))
         self._pending_size_updates.clear()
         self._update_listing_summary(False)
         highlighted = self._highlighted_entry()
@@ -465,6 +481,13 @@ class DiskExplorerApp(App[None]):
             f"Modified: {_format_modified(entry.modified_ns)}",
             f"Scan: {entry.scan_status.value.title()}",
         ]
+        if entry.scan_status is ScanStatus.CACHED and result is not None:
+            details.append("Source: cached (validated by metadata and TTL)")
+        if entry.scan_status is ScanStatus.CACHED_PARTIAL:
+            details.append(
+                "Source: cached, partial - the cached total excludes paths that could "
+                "not be read when it was taken"
+            )
         if entry.is_symlink or entry.is_reparse_point:
             reason = SkipReason.REPARSE_POINT if entry.is_reparse_point else SkipReason.SYMLINK
             details.append(f"Not traversed: {SKIP_REASON_DETAIL[reason]}")

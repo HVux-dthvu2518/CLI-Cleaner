@@ -58,6 +58,10 @@ class ScanResult:
     is_complete: bool = True
     cancelled: bool = False
     skipped_details: list[SkippedEntry] = field(default_factory=list)
+    #: True when the totals came from the hybrid cache. Never persisted, because
+    #: a row describes the source, not the data; ``is_complete`` is what a caller
+    #: must trust.
+    from_cache: bool = False
 
     def skipped_count(self, reason: SkipReason) -> int:
         """Return how many entries were skipped for one reason."""

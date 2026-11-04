@@ -34,6 +34,7 @@ class CacheStats:
     listing_misses: int = 0
     size_hits: int = 0
     size_misses: int = 0
+    partial_hits: int = 0
     skipped_writes: int = 0
     invalidations: int = 0
     last_miss_reason: str = ""
@@ -61,9 +62,10 @@ class CacheStats:
     def summary(self) -> str:
         if not self.hits and not self.misses:
             return "cache idle"
+        partial = f" · {self.partial_hits} partial" if self.partial_hits else ""
         return (
             f"cache {self.hits} hit / {self.misses} miss "
-            f"({self.hit_rate * 100:.0f}%) · {self.mean_hit_ms:.3f} ms/hit"
+            f"({self.hit_rate * 100:.0f}%) · {self.mean_hit_ms:.3f} ms/hit{partial}"
         )
 
 
@@ -155,7 +157,10 @@ class CacheService:
                 self._record_miss("size", stale.detail, path, stale)
                 return None
         self.stats.size_hits += 1
+        if not record.result.is_complete:
+            self.stats.partial_hits += 1
         self.stats.hit_durations.append(time.perf_counter() - started)
+        record.result.from_cache = True
         self._trace("size-hit", path, validation)
         return record.result
 
@@ -185,8 +190,14 @@ class CacheService:
         return stored
 
     def store_size(self, result: ScanResult) -> bool:
-        """Store a recursive size when it is complete and not invalidated."""
-        if not self._storable(result.is_complete, result.cancelled, result.errors):
+        """Store a recursive size, including a labelled partial one.
+
+        A partial total is worth caching: the expensive case (a large tree with a
+        couple of protected folders) still costs a full walk on every visit. It is
+        only ever served back with ``is_complete=False`` and its error list, so no
+        caller can mistake it for a complete scan.
+        """
+        if not self._size_storable(result):
             self.stats.skipped_writes += 1
             return False
         stored = self.repository.store_size(result)
@@ -195,10 +206,24 @@ class CacheService:
         return stored
 
     def _storable(self, is_complete: bool, cancelled: bool, errors: list[str]) -> bool:
-        """A cache row may only represent a complete, error-free scan."""
+        """A *listing* row may only represent a complete, error-free scan.
+
+        Listings stay strict: a partial listing would silently hide children from
+        the Explorer, and the miss costs one ``scandir``.
+        """
         if not self.database.available:
             return False
         if cancelled or not is_complete or errors:
+            return False
+        return True
+
+    def _size_storable(self, result: ScanResult) -> bool:
+        """Sizes may be partial, but only with an explanation attached."""
+        if not self.database.available:
+            return False
+        if result.cancelled:
+            return False
+        if not result.is_complete and not result.errors:
             return False
         return True
 
