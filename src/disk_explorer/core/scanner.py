@@ -35,6 +35,16 @@ class FileSystemScanner:
         root = Path(path)
         result = DirectoryListing(root=root)
         try:
+            root_stat = root.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(root_stat.st_mode)
+                or stat.S_ISLNK(root_stat.st_mode)
+                or _is_reparse_point(root_stat)
+            ):
+                result.is_complete = False
+                result.skipped_entries = 1
+                result.errors.append(f"{root}: not a traversable directory")
+                return result
             with os.scandir(root) as children:
                 for child in children:
                     child_path = Path(child.path)

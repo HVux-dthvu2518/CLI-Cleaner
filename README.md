@@ -1,13 +1,13 @@
 # Disk Explorer & Cleanup Tool
 
-A performance-first Windows disk explorer built with Python 3.12+ and Textual. The current implementation completes **M0 (foundation)** and the filesystem-engine portion of **M1**. Explorer navigation, caching, analysis, search, and cleanup remain later milestones.
+A performance-first Windows disk explorer built with Python 3.12+ and Textual. The current implementation includes the M0 foundation, a working Explorer for browsing local directories, and the filesystem-engine portion of M1. SQLite caching, analysis, search, and cleanup remain later milestones.
 
 ## Run from source
 
 ```powershell
 py -3.12 -m venv .venv
 .venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,screenshots]"
 python start.py
 ```
 
@@ -15,8 +15,10 @@ The `disk-explorer` console command is also installed by `pip install -e .`. Sta
 
 ## Current foundations
 
-- Textual shell with Explorer, Analyzer, Search, and Cleanup workspaces, plus keyboard shortcuts `1`–`4` and `q`.
-- Responsive layout driven by terminal dimensions; workspace content is intentionally a milestone placeholder.
+- Textual shell with a live Explorer plus Analyzer, Search, and Cleanup workspaces; use `1`–`4` and `q` to navigate/quit.
+- Browse from the home directory or enter any folder path; use Enter/arrow keys, Backspace, refresh, multi-select, and the details panel.
+- Live listing/status includes folder and file counts, recursive-size progress, volume used/free space, and partial/error information.
+- Screenshot export defaults to PNG; press F2 to configure PNG, SVG, or JPEG and Ctrl+Shift+S to save under the user's data directory. The `screenshots` extra enables raster PNG/JPEG conversion without requiring a system Cairo install.
 - Typed file and scan-result models; unknown folder sizes use `None`.
 - Fast, non-recursive `os.scandir` listing and iterative recursive logical-size scanning.
 - Symlinks and Windows reparse points are not traversed. Directory identity is tracked to avoid duplicate traversal where the filesystem exposes stable inode IDs.
@@ -31,6 +33,9 @@ import asyncio
 from disk_explorer.services import ScanService
 
 async def inspect(path: str) -> None:
+    async def on_size(entry, result):
+        print(entry.name, entry.size, result.is_complete)
+
     async with ScanService(max_workers=4) as scans:
         listing = await scans.enumerate_directory(path)  # quick first stage
         # Render listing.entries before starting this second stage.
