@@ -1,8 +1,12 @@
+import asyncio
 from pathlib import Path
+import threading
+import time
 
 import pytest
 
 from disk_explorer.models.file_entry import FileEntry, ScanStatus
+from disk_explorer.models.scan_result import DirectoryListing
 from disk_explorer.services.scan_service import ScanService
 
 
@@ -15,7 +19,7 @@ async def test_async_service_enumerates_then_updates_folder_size(tmp_path: Path)
     updates: list[tuple[str, int | None]] = []
 
     try:
-        listing = await service.enumerate_directory(str(tmp_path))
+        listing = await service.enumerate_directory(tmp_path)
         entry = listing.entries[0]
         assert entry.size is None
         await service.calculate_child_sizes(
@@ -28,6 +32,39 @@ async def test_async_service_enumerates_then_updates_folder_size(tmp_path: Path)
     assert entry.size == 4
     assert entry.scan_status is ScanStatus.COMPLETE
     assert updates == [("folder", 4)]
+
+
+@pytest.mark.asyncio
+async def test_enumeration_task_cancellation_reaches_worker(tmp_path: Path) -> None:
+    class WaitingScanner:
+        engine_name = "python-test-double"
+
+        def __init__(self) -> None:
+            self.finished = threading.Event()
+            self.cancellation = None
+
+        def enumerate_directory(self, path, cancellation):
+            self.cancellation = cancellation
+            while not cancellation.is_set():
+                time.sleep(0.001)
+            self.finished.set()
+            return DirectoryListing(root=Path(path), is_complete=False, cancelled=True)
+
+        def calculate_size(self, path, cancellation):
+            raise AssertionError("not used")
+
+    scanner = WaitingScanner()
+    service = ScanService(max_workers=1, scanner=scanner)
+    task = asyncio.create_task(service.enumerate_directory(tmp_path))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    try:
+        assert await asyncio.to_thread(scanner.finished.wait, 1)
+        assert scanner.cancellation.is_set()
+    finally:
+        service.close()
 
 
 @pytest.mark.asyncio

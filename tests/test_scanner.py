@@ -1,7 +1,7 @@
 from pathlib import Path
 import threading
 
-from disk_explorer.core.scanner import FileSystemScanner
+from disk_explorer.core.scanner import FileSystemScanner, ScanCancellation
 from disk_explorer.models.file_entry import ScanStatus
 
 
@@ -69,6 +69,18 @@ def test_pre_cancelled_scan_is_incomplete(tmp_path: Path) -> None:
     assert result.cancelled
     assert not result.is_complete
     assert result.total_size == 0
+
+
+def test_pre_cancelled_enumeration_is_incomplete(tmp_path: Path) -> None:
+    (tmp_path / "file.txt").write_text("test", encoding="utf-8")
+    cancellation = ScanCancellation()
+    cancellation.set()
+
+    result = FileSystemScanner().enumerate_directory(tmp_path, cancellation)
+
+    assert result.cancelled
+    assert not result.is_complete
+    assert result.entries == []
 
 
 def test_symlink_root_is_not_enumerated(tmp_path: Path) -> None:

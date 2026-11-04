@@ -1,4 +1,9 @@
-"""Fast directory enumeration and iterative recursive logical-size scans."""
+"""Fast enumeration and recursive-size scanning with a Rust acceleration path.
+
+The extension releases Python's GIL during filesystem traversal. The Python
+implementation remains a compatible fallback for source runs without a built
+extension and for callers supplying their own threading.Event.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,7 @@ import os
 import stat
 import threading
 from pathlib import Path
+from typing import Any
 
 from disk_explorer.models.file_entry import FileEntry, ScanStatus
 from disk_explorer.models.scan_result import DirectoryListing, ScanResult
@@ -13,14 +19,30 @@ from disk_explorer.models.scan_result import DirectoryListing, ScanResult
 # Windows marks junctions and other reparse points with this file attribute.
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 
+try:
+    from disk_explorer import _rust_scanner
+except (ImportError, OSError):  # Source-tree development can use the pure-Python engine.
+    _rust_scanner = None
 
-def _is_reparse_point(file_stat: os.stat_result) -> bool:
-    attributes = getattr(file_stat, "st_file_attributes", 0)
-    return bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
 
+class ScanCancellation:
+    """Cancellation handle shared by Python fallback and optional Rust worker."""
 
-def _error_message(path: Path, error: OSError) -> str:
-    return f"{path}: {error.strerror or str(error)}"
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._native = _rust_scanner.CancellationToken() if _rust_scanner is not None else None
+
+    def set(self) -> None:
+        self._event.set()
+        if self._native is not None:
+            self._native.set()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    @property
+    def native_token(self) -> Any | None:
+        return self._native
 
 
 class FileSystemScanner:
@@ -30,10 +52,104 @@ class FileSystemScanner:
     are never traversed. Inaccessible or changing entries make results partial.
     """
 
-    def enumerate_directory(self, path: str | Path) -> DirectoryListing:
+    @property
+    def engine_name(self) -> str:
+        return "rust" if _rust_scanner is not None else "python"
+
+    def enumerate_directory(
+        self,
+        path: str | Path,
+        cancel_event: threading.Event | ScanCancellation | None = None,
+    ) -> DirectoryListing:
         """List immediate children without waiting for recursive folder sizes."""
         root = Path(path)
+        cancellation = cancel_event or ScanCancellation()
+        if _rust_scanner is not None and isinstance(cancellation, ScanCancellation):
+            native_token = cancellation.native_token
+            if native_token is not None:
+                entries, scanned, skipped, errors, complete, cancelled = _rust_scanner.enumerate_directory(
+                    str(root), native_token
+                )
+                return self._listing_from_rust(root, entries, scanned, skipped, errors, complete, cancelled)
+        return self._enumerate_python(root, cancellation)
+
+    def _listing_from_rust(
+        self,
+        root: Path,
+        entries: list[tuple[Any, ...]],
+        scanned: int,
+        skipped: int,
+        errors: list[str],
+        complete: bool,
+        cancelled: bool,
+    ) -> DirectoryListing:
+        return DirectoryListing(
+            root=root,
+            entries=[
+                FileEntry(
+                    path=root / name,
+                    name=name,
+                    is_directory=is_directory,
+                    size=size,
+                    modified_ns=modified_ns,
+                    extension=extension,
+                    scan_status=ScanStatus.PENDING if is_directory else ScanStatus.COMPLETE,
+                    is_symlink=is_symlink,
+                    is_reparse_point=is_reparse,
+                )
+                for name, is_directory, size, modified_ns, extension, is_symlink, is_reparse in entries
+            ],
+            scanned_entries=scanned,
+            skipped_entries=skipped,
+            errors=errors,
+            is_complete=complete,
+            cancelled=cancelled,
+        )
+
+    def calculate_size(
+        self,
+        path: str | Path,
+        cancel_event: threading.Event | ScanCancellation | None = None,
+    ) -> ScanResult:
+        """Calculate a directory's logical size, dispatching to Rust if built."""
+        root = Path(path)
+        cancellation = cancel_event or ScanCancellation()
+        if _rust_scanner is not None and isinstance(cancellation, ScanCancellation):
+            native_token = cancellation.native_token
+            if native_token is not None:
+                (
+                    total_size,
+                    total_files,
+                    total_directories,
+                    scanned_entries,
+                    skipped_entries,
+                    errors,
+                    is_complete,
+                    cancelled,
+                ) = _rust_scanner.calculate_size(str(root), native_token)
+                return ScanResult(
+                    root=root,
+                    total_size=total_size,
+                    total_files=total_files,
+                    total_directories=total_directories,
+                    scanned_entries=scanned_entries,
+                    skipped_entries=skipped_entries,
+                    errors=errors,
+                    is_complete=is_complete,
+                    cancelled=cancelled,
+                )
+        return self._calculate_size_python(root, cancellation)
+
+    def _enumerate_python(
+        self,
+        root: Path,
+        cancellation: threading.Event | ScanCancellation,
+    ) -> DirectoryListing:
         result = DirectoryListing(root=root)
+        if cancellation.is_set():
+            result.is_complete = False
+            result.cancelled = True
+            return result
         try:
             root_stat = root.stat(follow_symlinks=False)
             if (
@@ -47,6 +163,10 @@ class FileSystemScanner:
                 return result
             with os.scandir(root) as children:
                 for child in children:
+                    if cancellation.is_set():
+                        result.is_complete = False
+                        result.cancelled = True
+                        break
                     child_path = Path(child.path)
                     result.scanned_entries += 1
                     try:
@@ -77,15 +197,12 @@ class FileSystemScanner:
             result.errors.append(_error_message(root, error))
         return result
 
-    def calculate_size(
+    def _calculate_size_python(
         self,
-        path: str | Path,
-        cancel_event: threading.Event | None = None,
+        root: Path,
+        cancellation: threading.Event | ScanCancellation,
     ) -> ScanResult:
-        """Calculate a directory's logical size using an iterative traversal."""
-        root = Path(path)
         result = ScanResult(root=root)
-        cancellation = cancel_event or threading.Event()
         try:
             root_stat = root.stat(follow_symlinks=False)
         except OSError as error:
@@ -100,8 +217,6 @@ class FileSystemScanner:
             result.errors.append(f"{root}: not a traversable directory")
             return result
 
-        # Device/inode identity prevents cycles and duplicate traversal where
-        # the filesystem exposes stable identifiers.
         visited: set[tuple[int, int]] = set()
 
         def identity(item_stat: os.stat_result) -> tuple[int, int] | None:
@@ -156,5 +271,13 @@ class FileSystemScanner:
                 result.skipped_entries += 1
                 result.is_complete = False
                 result.errors.append(_error_message(directory, error))
-
         return result
+
+
+def _is_reparse_point(file_stat: os.stat_result) -> bool:
+    attributes = getattr(file_stat, "st_file_attributes", 0)
+    return bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _error_message(path: Path, error: OSError) -> str:
+    return f"{path}: {error.strerror or str(error)}"

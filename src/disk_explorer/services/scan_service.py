@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from disk_explorer.core.scanner import FileSystemScanner
+from disk_explorer.core.scanner import FileSystemScanner, ScanCancellation
 from disk_explorer.models.file_entry import FileEntry, ScanStatus
 from disk_explorer.models.scan_result import DirectoryListing, ScanResult
 
@@ -24,19 +23,33 @@ class ScanService:
         self.max_workers = max_workers
         self.scanner = scanner or FileSystemScanner()
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="disk-scan")
-        self._active_cancellations: set[threading.Event] = set()
+        self._active_cancellations: set[ScanCancellation] = set()
         self._closed = False
+
+    @property
+    def engine_name(self) -> str:
+        return self.scanner.engine_name
 
     async def enumerate_directory(self, path: str | Path) -> DirectoryListing:
         """Return immediate children as soon as enumeration is done."""
         self._ensure_open()
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, self.scanner.enumerate_directory, path)
+        cancellation = ScanCancellation()
+        self._active_cancellations.add(cancellation)
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                self._executor, self.scanner.enumerate_directory, path, cancellation
+            )
+        except asyncio.CancelledError:
+            cancellation.set()
+            raise
+        finally:
+            self._active_cancellations.discard(cancellation)
 
     async def calculate_directory_size(self, path: str) -> ScanResult:
         """Calculate one directory without blocking the asyncio event loop."""
         self._ensure_open()
-        cancellation = threading.Event()
+        cancellation = ScanCancellation()
         self._active_cancellations.add(cancellation)
         try:
             loop = asyncio.get_running_loop()
@@ -56,8 +69,8 @@ class ScanService:
     ) -> None:
         """Fill directory sizes incrementally, calling back after each result.
 
-        The executor and an asyncio semaphore both enforce the configured
-        concurrency. Cancellation is cooperative inside the filesystem walk.
+        A fixed number of coordinator tasks submit work to the bounded
+        executor. Cancellation is cooperative inside the filesystem walk.
         """
         self._ensure_open()
         directories = (
@@ -67,7 +80,7 @@ class ScanService:
         )
 
         async def update_entry(entry: FileEntry) -> None:
-            cancellation = threading.Event()
+            cancellation = ScanCancellation()
             self._active_cancellations.add(cancellation)
             entry.scan_status = ScanStatus.SCANNING
             try:
