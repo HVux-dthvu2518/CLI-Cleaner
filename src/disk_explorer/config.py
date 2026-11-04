@@ -20,6 +20,9 @@ class AppConfig:
     default_sort: str = "size"
     sort_descending: bool = True
     screenshot_format: str = "png"
+    # Traversal policy. Both default to the safe "never follow links" behaviour.
+    follow_links: bool = False
+    reparse_mounts: bool = False
 
 
 def user_data_dir() -> Path:
@@ -57,6 +60,8 @@ def load_config(path: Path | None = None) -> AppConfig:
     config.screenshot_format = (
         screenshot_format if screenshot_format in {"png", "svg", "jpeg"} else defaults.screenshot_format
     )
+    config.follow_links = bool(config.follow_links)
+    config.reparse_mounts = bool(config.reparse_mounts)
     return config
 
 

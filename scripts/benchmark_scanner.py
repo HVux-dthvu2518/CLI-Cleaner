@@ -66,14 +66,33 @@ def main() -> int:
         f"speedup {python_size_ms / max(rust_size_ms, 0.001):.2f}x "
         f"({rust_size.total_files:,} files, {rust_size.total_size:,} logical bytes)"
     )
-    agrees = (
-        python_listing.scanned_entries == rust_listing.scanned_entries
-        and python_size.total_size == rust_size.total_size
-        and python_size.total_files == rust_size.total_files
-        and python_size.is_complete == rust_size.is_complete
-    )
-    print(f"Result parity: {'yes' if agrees else 'DIFFERS; inspect permissions/tree changes'}")
-    if not agrees:
+    checks = {
+        "listing names": sorted(entry.name for entry in python_listing.entries)
+        == sorted(entry.name for entry in rust_listing.entries),
+        "listing sizes": sorted((entry.name, entry.size) for entry in python_listing.entries)
+        == sorted((entry.name, entry.size) for entry in rust_listing.entries),
+        "listing flags": sorted(
+            (entry.name, entry.is_directory, entry.is_symlink, entry.is_reparse_point)
+            for entry in python_listing.entries
+        )
+        == sorted(
+            (entry.name, entry.is_directory, entry.is_symlink, entry.is_reparse_point)
+            for entry in rust_listing.entries
+        ),
+        "listing skips": sorted((item.path.name, item.reason) for item in python_listing.skipped_details)
+        == sorted((item.path.name, item.reason) for item in rust_listing.skipped_details),
+        "scanned entries": python_listing.scanned_entries == rust_listing.scanned_entries,
+        "total size": python_size.total_size == rust_size.total_size,
+        "total files": python_size.total_files == rust_size.total_files,
+        "total directories": python_size.total_directories == rust_size.total_directories,
+        "skip reasons": sorted((item.path.name, item.reason) for item in python_size.skipped_details)
+        == sorted((item.path.name, item.reason) for item in rust_size.skipped_details),
+        "completeness": python_size.is_complete == rust_size.is_complete,
+    }
+    failed = [name for name, agrees in checks.items() if not agrees]
+    print(f"Result parity: {'yes' if not failed else 'DIFFERS in ' + ', '.join(failed)}")
+    if failed:
+        print("Inspect permissions and avoid changing the tree during the run.")
         return 1
     return 0
 
