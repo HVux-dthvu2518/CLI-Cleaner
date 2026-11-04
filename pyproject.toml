@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "disk-explorer-cleaner"
+version = "0.1.0"
+description = "A performance-oriented Windows disk explorer and cleanup TUI."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["textual>=0.70,<2"]
+
+[project.optional-dependencies]
+windows = ["send2trash>=1.8"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "pytest-cov>=5"]
+
+[project.scripts]
+disk-explorer = "disk_explorer.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+disk_explorer = ["ui/styles/*.tcss"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
