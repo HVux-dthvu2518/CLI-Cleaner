@@ -1,0 +1,34 @@
+Screen {
+    background: $surface;
+}
+
+#main {
+    height: 1fr;
+    min-height: 5;
+    padding: 0 1;
+}
+
+TabbedContent {
+    height: 1fr;
+}
+
+TabPane {
+    padding: 1 2;
+}
+
+.workspace-copy {
+    width: 100%;
+    height: 1fr;
+    content-align: left top;
+    padding: 1 2;
+    border: round $primary-darken-2;
+    color: $text;
+}
+
+#status {
+    height: auto;
+    min-height: 1;
+    padding: 0 1;
+    color: $text-muted;
+    background: $boost;
+}
