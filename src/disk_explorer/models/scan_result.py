@@ -35,6 +35,9 @@ class DirectoryListing:
     is_complete: bool = True
     cancelled: bool = False
     skipped_details: list[SkippedEntry] = field(default_factory=list)
+    #: True when the listing was served from the hybrid cache. Never persisted,
+    #: because a row describes the source, not the data.
+    from_cache: bool = False
 
     @property
     def skipped_summary(self) -> str:
