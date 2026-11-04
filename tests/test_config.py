@@ -23,7 +23,14 @@ def test_invalid_config_uses_defaults(tmp_path: Path) -> None:
 
 def test_invalid_worker_value_falls_back_to_default(tmp_path: Path) -> None:
     path = tmp_path / "wrong-types.json"
-    path.write_text('{"max_workers": "many", "cache_ttl_minutes": null}', encoding="utf-8")
+    path.write_text('{"max_workers": "many", "cache_ttl_minutes": null, "screenshot_format": "bmp"}', encoding="utf-8")
     loaded = load_config(path)
     assert loaded.max_workers == AppConfig().max_workers
     assert loaded.cache_ttl_minutes == AppConfig().cache_ttl_minutes
+    assert loaded.screenshot_format == "png"
+
+
+def test_jpg_screenshot_setting_normalizes_to_jpeg(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text('{"screenshot_format": "JPG"}', encoding="utf-8")
+    assert load_config(path).screenshot_format == "jpeg"

@@ -71,6 +71,23 @@ def test_pre_cancelled_scan_is_incomplete(tmp_path: Path) -> None:
     assert result.total_size == 0
 
 
+def test_symlink_root_is_not_enumerated(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "private.txt").write_text("secret", encoding="utf-8")
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        return
+
+    listing = FileSystemScanner().enumerate_directory(link)
+
+    assert not listing.is_complete
+    assert not listing.entries
+    assert "not a traversable directory" in listing.errors[0]
+
+
 def test_missing_root_is_an_incomplete_result(tmp_path: Path) -> None:
     missing = tmp_path / "does-not-exist"
 

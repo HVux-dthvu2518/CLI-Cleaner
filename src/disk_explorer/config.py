@@ -19,6 +19,7 @@ class AppConfig:
     cache_ttl_minutes: int = 30
     default_sort: str = "size"
     sort_descending: bool = True
+    screenshot_format: str = "png"
 
 
 def user_data_dir() -> Path:
@@ -50,6 +51,12 @@ def load_config(path: Path | None = None) -> AppConfig:
         config.cache_ttl_minutes = max(1, int(config.cache_ttl_minutes))
     except (TypeError, ValueError):
         config.cache_ttl_minutes = defaults.cache_ttl_minutes
+    screenshot_format = str(config.screenshot_format).lower()
+    if screenshot_format == "jpg":
+        screenshot_format = "jpeg"
+    config.screenshot_format = (
+        screenshot_format if screenshot_format in {"png", "svg", "jpeg"} else defaults.screenshot_format
+    )
     return config
 
 
