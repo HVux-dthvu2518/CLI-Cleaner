@@ -28,6 +28,8 @@ if importlib.util.find_spec("disk_explorer") is None:
     sys.path.insert(0, str(ROOT / "src"))
 
 from disk_explorer import __version__  # noqa: E402
+from disk_explorer.cache import CacheService, Database, describe as describe_schema  # noqa: E402
+from disk_explorer.config import cache_database_path, load_config, user_data_dir  # noqa: E402
 from disk_explorer.core import scanner as scanner_module  # noqa: E402
 from disk_explorer.core.scanner import FileSystemScanner  # noqa: E402
 
@@ -131,6 +133,39 @@ def _long_path_problems() -> list[str]:
     ]
 
 
+def report_cache() -> list[str]:
+    """Report the hybrid cache: location, schema, contents and health."""
+    config = load_config()
+    problems: list[str] = []
+    if not config.cache_enabled:
+        _line("Hybrid cache", "disabled in settings.json")
+        problems.append(
+            "The hybrid cache is disabled (cache_enabled=false), so every view rescans."
+        )
+        return problems
+    path = cache_database_path(config.cache_path)
+    _line("Hybrid cache", path)
+    _line("Cache exists", path.exists())
+    _line("TTL", f"{config.cache_ttl_minutes} minutes")
+    _line("Schema", describe_schema())
+    database = Database(path)
+    service = CacheService(database, ttl_minutes=config.cache_ttl_minutes)
+    try:
+        if not service.open():
+            return [f"The cache could not be opened: {database.unavailable_reason}"]
+        counts = service.repository.counts()
+        _line("Cached rows", f"{counts['listings']} listings / {counts['sizes']} sizes")
+        if database.recovery_count:
+            problems.append(
+                "The cache database was damaged and has been rebuilt empty; "
+                f"the damaged file was kept as {path.name}.corrupt-*."
+            )
+    finally:
+        service.close()
+    _line("User data dir", user_data_dir())
+    return problems
+
+
 def report_selftest() -> list[str]:
     """Scan a tiny tree that includes a link, and explain the outcome."""
     with tempfile.TemporaryDirectory() as temporary:
@@ -174,6 +209,8 @@ def main() -> int:
     problems += report_engine()
     print("\n== Traversal policy ==")
     problems += report_traversal()
+    print("\n== Hybrid cache ==")
+    problems += report_cache()
     if args.selftest:
         print("\n== Self-test ==")
         problems += report_selftest()

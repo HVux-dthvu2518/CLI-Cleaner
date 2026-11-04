@@ -58,6 +58,10 @@ python -m pip install -e ".[dev,screenshots]"
 pytest
 ```
 
+Cache-aware tests use a temporary database and never touch your real cache;
+`tests/test_cache.py` and `tests/test_cache_integration.py` cover persistence,
+validation, invalidation, cancellation, concurrency and corruption recovery.
+
 The suite runs without a Rust toolchain: engine contract tests validate the Python engine as the reference and automatically compare the Rust engine when it is importable (`tests/test_engine_contract.py`), plus source-level guards in `tests/test_rust_source.py`.
 
 For a direct local extension build after dependencies are installed:
@@ -130,6 +134,70 @@ If you accept the risk of loops and duplicate counting, opt in through `settings
 
 Skipped entries are never treated as errors, and errors are never treated as skips: a skipped link keeps the scan complete, while a permission failure makes it partial.
 
+## SQLite hybrid cache
+
+Scans are cached per user so returning to a folder is instant, without ever
+showing stale data as fresh. The cache never holds user data and can be deleted
+at any time.
+
+```powershell
+# Where it lives
+$env:LOCALAPPDATA\DiskExplorerCleaner\cache\scan-cache.sqlite3
+
+# Disable it, change the TTL (minutes), or relocate it in settings.json
+{ "cache_enabled": true, "cache_ttl_minutes": 30, "cache_path": "" }
+```
+
+**Separate tables, separate rules.** `listings` (immediate children) are validated
+by the directory's modification time and the TTL. `sizes` (recursive totals) are
+validated by TTL, the root mtime, and the recorded mtimes of child listings from
+the same scan — a directory's own mtime cannot see changes deeper in the tree,
+which is exactly why the TTL exists. Full column reference and failure matrix:
+[docs/cache-schema.md](docs/cache-schema.md).
+
+**What is never cached.** Only complete, error-free scans are stored. Cancelled or
+partial scans and permission errors are skipped, so a cache hit can never
+resurrect a partial result as a success, and an unreadable folder is never cached
+as empty.
+
+**Refresh means refresh.** `r` (or the Refresh button) drops the cached rows for
+the current folder and rescans. Startup housekeeping prunes rows past their TTL.
+
+**Failures fall back to scanning.** A corrupted database is renamed to
+`scan-cache.sqlite3.corrupt-<timestamp>` and rebuilt; an unwritable directory, a
+locked database, or a newer schema version simply disables the cache for the
+session. The application never fails because of the cache.
+
+Scoping: list and recursive-size data can be cached **only if** the directory mtime
+is readable, which needs a directory the app can `stat`. Network shares with
+unreliable timestamps will mostly cache-miss rather than serve stale data — an
+intentional trade.
+
+### Measured behaviour
+
+`scripts/benchmark_cache.py` reports medians for this machine and filesystem;
+cache warmth, antivirus and storage type dominate the numbers, so do not read them
+as general speedups. On the development sandbox (Linux, Python engine, warm cache):
+
+| Workload | Fresh | Cache hit | Notes |
+| --- | --- | --- | --- |
+| Enumerate `/usr/share` | 0.42 ms | 0.22 ms | 63 direct children |
+| Large directory (2,000 entries, synthetic) | 9.05 ms | 3.78 ms | ~1.9 µs per entry to decode |
+| Recursive size of `/usr/share` | 40.34 ms | 1.30 ms | 4,872 entries; the case caching targets |
+| Invalidate + refresh `/usr/share` | — | 0.58 ms | miss + scan + store |
+
+Reproduce on Windows with your own folders:
+
+```powershell
+py scripts/benchmark_cache.py --synthetic --entries 2000 --dirs 4 --repeats 5
+py scripts/benchmark_cache.py --path $HOME\Downloads --repeats 3
+```
+
+The honest summary: the cache buys very little for a single small local
+`scandir` (fractions of a millisecond, sometimes slower than the syscall), and a
+lot for recursive sizes and antivirus-scanned or network storage. It is not a
+substitute for the Rust engine on enumeration cost.
+
 ## Engine contract
 
 Both engines are reached through `FileSystemScanner` and return the same records, so a missing or broken extension cannot change scan semantics:
@@ -156,4 +224,5 @@ _rust_scanner.calculate_size(path, token, follow_links=False, reparse_mounts=Fal
 - Live folder/file counts, drive used/free space, size progress, details, and partial/error status.
 - Screenshot export defaults to PNG; press F2 to configure PNG, SVG, or JPEG and Ctrl+Shift+S to save under the user's data directory.
 - Application settings and structured JSONL logs are stored per-user (`%LOCALAPPDATA%\DiskExplorerCleaner` on Windows; `$XDG_DATA_HOME/disk-explorer-cleaner` or `~/.local/share/disk-explorer-cleaner` elsewhere).
-- Analyzer, Search, SQLite caching, and cleanup/deletion are later milestones and are not implemented yet.
+- SQLite hybrid caching is implemented (`src/disk_explorer/cache/`): directory listings and recursive folder sizes are cached separately, validated by metadata + TTL, and invalidated on manual refresh. See [docs/cache-schema.md](docs/cache-schema.md).
+- Analyzer, Search, and cleanup/deletion are later milestones and are not implemented yet.

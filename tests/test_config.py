@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from disk_explorer.config import AppConfig, load_config, save_config
+from disk_explorer.config import AppConfig, cache_database_path, load_config, save_config
 
 
 def test_config_round_trip_and_worker_bounds(tmp_path: Path) -> None:
@@ -34,3 +34,24 @@ def test_jpg_screenshot_setting_normalizes_to_jpeg(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     path.write_text('{"screenshot_format": "JPG"}', encoding="utf-8")
     assert load_config(path).screenshot_format == "jpeg"
+
+
+def test_cache_settings_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    save_config(AppConfig(cache_enabled=False, cache_ttl_minutes=0, cache_path=str(tmp_path / "x.sqlite3")), path)
+
+    loaded = load_config(path)
+
+    assert loaded.cache_enabled is False
+    assert loaded.cache_ttl_minutes >= 1  # clamped: a TTL of 0 minutes is meaningless
+    assert loaded.cache_path.endswith("x.sqlite3")
+
+
+def test_cache_database_path_defaults_inside_the_user_data_dir(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    default = cache_database_path()
+    override = cache_database_path(str(tmp_path / "elsewhere" / "cache.sqlite3"))
+
+    assert default == tmp_path / "disk-explorer-cleaner" / "cache" / "scan-cache.sqlite3"
+    assert override == tmp_path / "elsewhere" / "cache.sqlite3"

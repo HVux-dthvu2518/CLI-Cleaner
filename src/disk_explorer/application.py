@@ -14,7 +14,15 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Button, DataTable, Footer, Header, Input, Static, TabbedContent, TabPane
 
-from disk_explorer.config import AppConfig, load_config, save_config, user_data_dir
+from disk_explorer.cache.cache_service import CacheService
+from disk_explorer.cache.database import CacheUnavailable, Database
+from disk_explorer.config import (
+    AppConfig,
+    cache_database_path,
+    load_config,
+    save_config,
+    user_data_dir,
+)
 from disk_explorer.core.scanner import FileSystemScanner
 from disk_explorer.infrastructure.logging import configure_logging
 from disk_explorer.models.file_entry import FileEntry
@@ -71,12 +79,14 @@ class DiskExplorerApp(App[None]):
         super().__init__()
         self.config: AppConfig = load_config()
         self.logger = configure_logging()
+        self.cache_service = self._build_cache_service()
         self.scan_service = ScanService(
             max_workers=self.config.max_workers,
             scanner=FileSystemScanner(
                 follow_links=self.config.follow_links,
                 reparse_mounts=self.config.reparse_mounts,
             ),
+            cache=self.cache_service,
         )
         self.current_path = Path.home()
         self._entries: list[FileEntry] = []
@@ -97,7 +107,31 @@ class DiskExplorerApp(App[None]):
         self._listing_skipped: list[SkippedEntry] = []
         self._size_skipped: list[SkippedEntry] = []
         self._listing_errors: list[str] = []
+        self._refresh_requested = False
         self.logger.info("Application started", extra={"operation": "startup", "result": "ok"})
+
+    def _build_cache_service(self) -> CacheService | None:
+        """Create the cache service; a broken cache must never block browsing."""
+        if not self.config.cache_enabled:
+            self.logger.info("Hybrid cache disabled in settings", extra={"operation": "cache", "result": "disabled"})
+            return None
+        database = Database(cache_database_path(self.config.cache_path), self.logger)
+        service = CacheService(database, ttl_minutes=self.config.cache_ttl_minutes, logger=self.logger)
+        try:
+            if not service.open():
+                self.logger.warning(
+                    "Cache unavailable; every scan reads the filesystem",
+                    extra={"operation": "cache", "result": database.unavailable_reason or "unknown"},
+                )
+                return None
+            service.prune()
+        except (OSError, CacheUnavailable) as error:
+            self.logger.warning(
+                "Cache setup failed; scanning without it",
+                extra={"operation": "cache", "result": str(error)},
+            )
+            return None
+        return service
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -205,6 +239,8 @@ class DiskExplorerApp(App[None]):
             self._navigate_to(parent)
 
     def action_refresh(self) -> None:
+        """Re-scan the current folder, ignoring any cached rows for it."""
+        self._refresh_requested = True
         self._navigate_to(self.current_path)
 
     def action_focus_location(self) -> None:
@@ -266,6 +302,8 @@ class DiskExplorerApp(App[None]):
         self.current_path = Path(os.path.abspath(path))
         self._navigation_id += 1
         navigation_id = self._navigation_id
+        refresh = self._refresh_requested
+        self._refresh_requested = False
         self._query_base("#path-input", Input).value = str(self.current_path)
         self._query_base("#file-table", DataTable).clear(columns=False)
         self._entries.clear()
@@ -288,15 +326,15 @@ class DiskExplorerApp(App[None]):
         self._set_status(f"Reading with {self.scan_service.engine_name.title()} engine · {self.current_path}…")
         self._query_base("#listing-summary", Static).update("Reading directory…")
         self.run_worker(
-            self._load_directory(self.current_path, navigation_id),
+            self._load_directory(self.current_path, navigation_id, refresh),
             name="directory-scan",
             group="navigation",
             exclusive=True,
             thread=False,
         )
 
-    async def _load_directory(self, path: Path, navigation_id: int) -> None:
-        listing = await self.scan_service.enumerate_directory(path)
+    async def _load_directory(self, path: Path, navigation_id: int, refresh: bool = False) -> None:
+        listing = await self.scan_service.enumerate_directory(path, refresh=refresh)
         if not self.is_running or navigation_id != self._navigation_id:
             return
         self._entries = sorted(
@@ -336,14 +374,17 @@ class DiskExplorerApp(App[None]):
         if not listing.is_complete and not self._entries:
             self._set_status(f"Could not read directory · {len(listing.errors)} error(s) · {path}", error=True)
             return
+        source = "cached listing" if listing.from_cache else f"{self.scan_service.engine_name.title()} listing"
         self._set_status(
-            f"Listed {len(self._entries)} items · {self.scan_service.engine_name.title()} size scan running · {path}"
+            f"Listed {len(self._entries)} items · {source} · folder sizes running · {path}"
         )
         try:
             async def on_size_update(entry: FileEntry, result: ScanResult) -> None:
                 await self._on_size_update(entry, result, navigation_id)
 
-            await self.scan_service.calculate_child_sizes(self._entries, on_size_update)
+            await self.scan_service.calculate_child_sizes(
+                self._entries, on_size_update, refresh=refresh
+            )
         except asyncio.CancelledError:
             raise
         except Exception as error:

@@ -17,6 +17,8 @@ class AppConfig:
     max_workers: int = 4
     cache_enabled: bool = True
     cache_ttl_minutes: int = 30
+    #: Optional override for the cache database; defaults to the user data dir.
+    cache_path: str = ""
     default_sort: str = "size"
     sort_descending: bool = True
     screenshot_format: str = "png"
@@ -32,6 +34,13 @@ def user_data_dir() -> Path:
         return Path(base) / "DiskExplorerCleaner" if base else Path.home() / "AppData" / "Local" / "DiskExplorerCleaner"
     base = os.environ.get("XDG_DATA_HOME")
     return Path(base) / "disk-explorer-cleaner" if base else Path.home() / ".local" / "share" / "disk-explorer-cleaner"
+
+
+def cache_database_path(configured: str = "") -> Path:
+    """Resolve the SQLite cache file, keeping it inside the user's data dir."""
+    if configured.strip():
+        return Path(configured).expanduser()
+    return user_data_dir() / "cache" / "scan-cache.sqlite3"
 
 
 def load_config(path: Path | None = None) -> AppConfig:
@@ -62,6 +71,8 @@ def load_config(path: Path | None = None) -> AppConfig:
     )
     config.follow_links = bool(config.follow_links)
     config.reparse_mounts = bool(config.reparse_mounts)
+    config.cache_enabled = bool(config.cache_enabled)
+    config.cache_path = str(config.cache_path or "")
     return config
 
 
