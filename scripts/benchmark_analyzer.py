@@ -7,6 +7,7 @@ a number disguised as a success.
 Usage (PowerShell):
 
     py scripts/benchmark_analyzer.py --synthetic --files 20000 --folders 40
+    py scripts/benchmark_analyzer.py --folder-heavy --folders 2000
     py scripts/benchmark_analyzer.py --path C:\\Users\\You\\Downloads
 
 Measured on this machine and filesystem only.
@@ -46,6 +47,19 @@ def build_synthetic(root: Path, files: int, folders: int) -> None:
             (folder / name).write_bytes(b"x" * payload)
 
 
+def build_folder_heavy(root: Path, folders: int) -> None:
+    """Many small folders: the shape that exposed the O(folders x tree) sizing bug.
+
+    Grouped by parent to stay under Windows' classic path-length limit.
+    """
+    groups = max(1, folders // 100)
+    for index in range(folders):
+        folder = root / f"group{index % groups:02d}" / f"n{index:05d}"
+        folder.mkdir(parents=True, exist_ok=True)
+        for item in range(3):
+            (folder / f"f{item}.dat").write_bytes(b"x" * (16 * (item + 1)))
+
+
 def timed_run(service: AnalyzerService, root: Path, **kwargs) -> tuple[float, object]:
     started = time.perf_counter()
     snapshot = service.analyze_sync(root, **kwargs)
@@ -79,17 +93,23 @@ def main() -> int:
     parser.add_argument("--synthetic", action="store_true", help="generate a temporary tree")
     parser.add_argument("--files", type=int, default=20000, help="files to generate")
     parser.add_argument("--folders", type=int, default=40, help="folders to generate")
+    parser.add_argument(
+        "--folder-heavy", action="store_true", help="nested tree that stresses per-folder work"
+    )
     parser.add_argument("--repeats", type=int, default=3, help="runs per measurement")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
 
     temporary: tempfile.TemporaryDirectory[str] | None = None
-    if args.synthetic:
+    if args.synthetic or args.folder_heavy:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name) / "tree"
         root.mkdir()
-        build_synthetic(root, args.files, args.folders)
+        if args.folder_heavy:
+            build_folder_heavy(root, args.folders)
+        else:
+            build_synthetic(root, args.files, args.folders)
         cache_root = Path(temporary.name) / "cache"
     elif args.path:
         root = args.path.expanduser().resolve()
@@ -136,6 +156,19 @@ def main() -> int:
             refresh_runs.append(duration)
         describe("Forced refresh", snapshot, statistics.median(refresh_runs))
 
+        # Cache-only cost: rebuilding from stored totals, no walking at all.
+        cached_runs = []
+        hit_rate = 0.0
+        for _ in range(args.repeats):
+            started = time.perf_counter()
+            cached = cache.cached_sizes([record.path for record in snapshot.largest_folders])
+            cached_runs.append((time.perf_counter() - started) * 1000.0)
+            hit_rate = len(cached) / max(1, len(snapshot.largest_folders))
+        print(
+            f"{'Cache lookup (no walk)':<34} {statistics.median(cached_runs):9.2f} ms   "
+            f"{len(cached):,} folder totals · {hit_rate * 100:.0f}% hit"
+        )
+
         # Filters should reduce the reported set without changing what was read.
         filtered_runs = []
         for _ in range(args.repeats):
@@ -147,6 +180,7 @@ def main() -> int:
 
         counts = cache.repository.counts()
         print(f"\nCache rows : {counts['listings']} listings, {counts['sizes']} sizes")
+        print(f"Folders    : {len(snapshot.children)} direct children of the analysed folder")
         print(f"Analyzer   : top {len(snapshot.largest_files)} files, "
               f"top {len(snapshot.largest_folders)} folders, "
               f"{len(snapshot.extensions.entries)} extensions")

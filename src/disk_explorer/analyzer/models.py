@@ -180,6 +180,10 @@ class AnalysisSnapshot:
     status: SnapshotStatus
     largest_files: list[FileRecord] = field(default_factory=list)
     largest_folders: list[FolderRecord] = field(default_factory=list)
+    #: Direct children of ``root``, largest first. Mutually disjoint, so they can be
+    #: drawn as one treemap without double counting (``largest_folders`` cannot: it
+    #: mixes a folder with its own ancestors).
+    children: list[FolderRecord] = field(default_factory=list)
     extensions: ExtensionSummary = field(
         default_factory=lambda: ExtensionSummary(entries=(), total_size=0, file_count=0)
     )
@@ -193,6 +197,8 @@ class AnalysisSnapshot:
     errors: list[str] = field(default_factory=list)
     cancelled: bool = False
     from_cache: bool = False
+    #: Folders whose entries came from the cache instead of the filesystem.
+    cached_directories: int = 0
     duration_seconds: float = 0.0
     #: Depth reached while collecting file records (bounded by configuration).
     max_depth_seen: int = 0
@@ -212,7 +218,9 @@ class AnalysisSnapshot:
         coverage = f"{self.total_files:,} files · {self.total_directories:,} folders · {self.total_size:,} B"
         skipped = f" · {self.skipped_entries:,} skipped" if self.skipped_entries else ""
         problems = f" · {len(self.errors)} unreadable" if self.errors else ""
-        source = " · cached" if self.from_cache else ""
+        source = ""
+        if self.cached_directories:
+            source = f" · {self.cached_directories:,}/{self.total_directories:,} folders cached"
         return f"{state}{source} · {coverage}{skipped}{problems}"
 
 

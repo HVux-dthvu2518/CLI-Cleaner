@@ -556,3 +556,100 @@ def test_v1_database_upgrades_and_keeps_its_rows(tmp_path: Path) -> None:
         assert result.total_size == 999 and result.is_complete is True
     finally:
         database.close()
+
+
+# -- batched listing access (used by the Analyzer walk) --------------------
+def _batch_listing(root: Path, entries: list[tuple[str, int]]) -> DirectoryListing:
+    files = [
+        FileEntry(
+            path=root / name,
+            name=name,
+            is_directory=False,
+            size=size,
+            modified_ns=1,
+            extension=".bin",
+            scan_status=ScanStatus.COMPLETE,
+        )
+        for name, size in entries
+    ]
+    return DirectoryListing(root=root, entries=files, scanned_entries=len(files))
+
+
+def test_batched_listings_round_trip(tmp_path: Path) -> None:
+    database = Database(tmp_path / "cache.sqlite3")
+    assert database.open()
+    try:
+        repository = CacheRepository(database)
+        folders = []
+        for index in range(5):
+            folder = tmp_path / f"folder{index}"
+            folder.mkdir()
+            (folder / "a.bin").write_bytes(b"a" * (index + 1))
+            folders.append(folder)
+        listings = [
+            _batch_listing(folder, [("a.bin", index + 1)]) for index, folder in enumerate(folders)
+        ]
+
+        assert repository.store_listings(listings) == 5
+
+        found = repository.load_listings(folders, CachePolicy())
+        assert len(found) == 5
+        assert sorted(entry.size for listing in found.values() for entry in listing.entries) == [
+            1, 2, 3, 4, 5
+        ]
+    finally:
+        database.close()
+
+
+def test_batched_listings_never_store_a_partial_listing(tmp_path: Path) -> None:
+    database = Database(tmp_path / "cache.sqlite3")
+    assert database.open()
+    try:
+        repository = CacheRepository(database)
+        folder = tmp_path / "folder"
+        folder.mkdir()
+        (folder / "a.bin").write_bytes(b"a")
+        partial = DirectoryListing(
+            root=folder,
+            entries=(),
+            scanned_entries=0,
+            is_complete=False,
+            cancelled=False,
+            errors=["Access is denied"],
+        )
+
+        assert repository.store_listings([partial]) == 0
+        assert repository.load_listings([folder], CachePolicy()) == {}
+    finally:
+        database.close()
+
+
+def test_batched_listings_drop_stale_rows(tmp_path: Path) -> None:
+    """A changed directory must miss, or the Analyzer would show a stale tree."""
+    database = Database(tmp_path / "cache.sqlite3")
+    assert database.open()
+    try:
+        repository = CacheRepository(database)
+        folder = tmp_path / "folder"
+        folder.mkdir()
+        (folder / "a.bin").write_bytes(b"a")
+        assert repository.store_listings([_batch_listing(folder, [("a.bin", 1)])]) == 1
+        assert repository.load_listings([folder], CachePolicy.from_minutes(30))
+
+        (folder / "b.bin").write_bytes(b"b")
+        # An explicit mtime change: some filesystems have coarse timestamps, and this
+        # test is about stale detection, not clock granularity.
+        stamp = folder.stat().st_mtime_ns
+        os.utime(folder, ns=(stamp + 5_000_000_000, stamp + 5_000_000_000))
+        assert repository.load_listings([folder], CachePolicy.from_minutes(30)) == {}
+    finally:
+        database.close()
+
+
+def test_batched_listings_are_safe_when_closed(tmp_path: Path) -> None:
+    database = Database(tmp_path / "cache.sqlite3")
+    assert database.open()
+    repository = CacheRepository(database)
+    database.close()
+    assert repository.load_listings([tmp_path], CachePolicy()) == {}
+    assert repository.store_listings([_batch_listing(tmp_path, [])]) == 0

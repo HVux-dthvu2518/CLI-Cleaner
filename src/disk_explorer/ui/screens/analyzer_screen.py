@@ -11,7 +11,8 @@ from pathlib import Path
 
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Container, Horizontal, Vertical
+from textual import events
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Button, DataTable, Input, Static, TabbedContent, TabPane
 
@@ -22,6 +23,7 @@ from disk_explorer.analyzer import (
     AnalyzerService,
     SnapshotStatus,
 )
+from disk_explorer.analyzer import visuals
 from disk_explorer.analyzer.report_exporter import export_all
 from disk_explorer.cache.cache_service import CacheService
 from disk_explorer.config import user_data_dir
@@ -62,6 +64,7 @@ class AnalyzerPanel(Container):
         self.start_path = start_path or Path.home()
         self.snapshot: AnalysisSnapshot | None = None
         self.descending = True
+        self._visual_width = 72
         self._analysis_active = False
         self._last_export: list[Path] = []
 
@@ -79,7 +82,13 @@ class AnalyzerPanel(Container):
                 yield Input(placeholder="Extension (.mp4)", id="analyzer-extension")
             yield Static("Choose a folder, then press Analyse. Nothing is scanned automatically.", id="analyzer-status")
             yield Static("", id="analyzer-overview")
-            with TabbedContent(initial="analyzer-files", id="analyzer-tabs"):
+            with TabbedContent(initial="analyzer-visuals", id="analyzer-tabs"):
+                with TabPane("Visuals", id="analyzer-visuals"):
+                    with VerticalScroll(id="analyzer-visual-scroll"):
+                        yield Static(
+                            "No analysis yet. Press Analyse to draw the treemap and charts.",
+                            id="analyzer-visual-text",
+                        )
                 with TabPane("Files", id="analyzer-files"):
                     yield DataTable(id="analyzer-files-table", cursor_type="row", zebra_stripes=True)
                 with TabPane("Folders", id="analyzer-folders"):
@@ -111,6 +120,14 @@ class AnalyzerPanel(Container):
         types.add_column("Total", key="total", width=12)
         types.add_column("Average", key="average", width=12)
         types.add_column("Share", key="share", width=8)
+
+    def on_resize(self, event: events.Resize) -> None:
+        """Redraw the treemap when the terminal gets wider or narrower."""
+        width = max(30, event.size.width - 8)
+        if abs(width - self._visual_width) >= 4:
+            self._visual_width = width
+            if self.snapshot is not None:
+                self._render_visuals(self.snapshot)
 
     # -- actions -----------------------------------------------------------
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -230,7 +247,19 @@ class AnalyzerPanel(Container):
             )
 
         self._render_overview(snapshot)
+        self._render_visuals(snapshot)
         self.query_one("#analyzer-overview", Static).update(self._overview_line(snapshot))
+
+    def _render_visuals(self, snapshot: AnalysisSnapshot) -> None:
+        """Draw the picture view: treemap, type ring, folder and file rankings."""
+        lines = visuals.dashboard(snapshot, width=self._visual_width)
+        if snapshot.children:
+            lines += [
+                "",
+                "[dim]Enter on the Folders tab opens that folder in the Explorer · "
+                "the treemap shows only direct children, so nothing is counted twice.[/dim]",
+            ]
+        self.query_one("#analyzer-visual-text", Static).update("\n".join(lines))
 
     def _overview_line(self, snapshot: AnalysisSnapshot) -> str:
         parts = [snapshot.status.label, f"{snapshot.total_files:,} files", f"{snapshot.total_directories:,} folders"]
@@ -240,8 +269,8 @@ class AnalyzerPanel(Container):
             parts.append(f"{snapshot.skipped_entries:,} skipped ({reasons})")
         if snapshot.errors:
             parts.append(f"{len(snapshot.errors)} unreadable")
-        if snapshot.from_cache:
-            parts.append("cached")
+        if snapshot.cached_directories:
+            parts.append(f"{snapshot.cached_directories:,} folders from cache")
         return "  ·  ".join(parts)
 
     def _render_overview(self, snapshot: AnalysisSnapshot) -> None:

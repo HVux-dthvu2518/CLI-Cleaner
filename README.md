@@ -226,11 +226,36 @@ how far the scan actually got.
 # Analyse a folder (nothing is scanned until you ask)
 #  2        open the Analyzer tab
 #  Analyse  run on the path in the toolbar
-#  Refresh  ignore cached folder sizes (force a real rescan)
+#  Refresh  ignore cached listings and sizes (force a real rescan)
 #  Export   write three CSV reports to the user data directory
 #  Sort ↑↓  toggle largest/smallest first
 #  enter    jump to that file's folder (or that folder) in the Explorer
 ```
+
+### Seeing it instead of reading it
+
+The **Visuals** tab (the first tab) answers "what is big" with shapes rather than a
+list of numbers:
+
+* a **treemap** of the analysed folder's direct children, where box area is
+  proportional to bytes, so the biggest folder is visibly the biggest;
+* a **ring chart** of bytes per file type, with the share next to each label;
+* **bars** for the largest folders and largest files;
+* a **drive used / analysed** bar, keeping allocated space separate from logical
+  bytes.
+
+Everything is drawn with standard library characters - no charting dependency - in
+`analyzer/visuals.py`, which has no Textual imports and is unit-tested for honesty
+rather than for pixels:
+
+* the treemap draws **only mutually exclusive folders** (the analysed folder's own
+  children). A "largest folders" list mixes a folder with its ancestors, so drawing
+  that list would double count;
+* every measured folder gets at least one cell, and anything not drawn is counted in
+  a `+N smaller (size) not drawn` line - the picture never quietly crops;
+* a folder whose size is unknown is **not drawn at all**, rather than drawn as zero;
+* an incomplete scan is labelled under the charts, so a partial picture cannot be
+  read as a complete one.
 
 Filters: minimum size in bytes and an extension such as `.mp4` (case-insensitive).
 
@@ -248,9 +273,21 @@ exclude unreadable paths. The scan state is always visible: `Complete`, `Partial
 unreadable paths listed.
 
 **Bounded work.** The walk is breadth-first with configurable limits
-(`AnalyzerLimits`): 20,000 folders analysed in detail, 40 levels deep. Hitting a
+(`AnalyzerLimits`): 50,000 folders analysed in detail, 64 levels deep. Hitting a
 limit marks the report `Partial` with an explanation instead of silently
 truncating it.
+
+**Folder totals cost nothing extra.** Every directory is enumerated exactly once,
+and each folder's recursive total is the bottom-up sum of the direct file bytes
+already collected. Asking the scanner for a recursive size per folder instead
+re-walks the subtree, which is O(folders × tree) - on a real 16,652-folder tree
+that was the difference between 15 s and well under a second.
+
+**A cache hit means "did not touch the disk".** Directory listings are cached as
+well as recursive sizes, and the walk reads them in batches (one query per sweep of
+256 folders). Only folders whose listing is missing or stale are enumerated, and
+only folders whose total actually changed are written back. The status line reports
+how many folders came from the cache, e.g. `94/94 folders cached`.
 
 **Reusable models.** `AnalysisSnapshot`, `FileRecord`, `FolderRecord` and
 `ExtensionSummary` are plain data with no Textual or SQLite imports (enforced by a
@@ -266,21 +303,24 @@ status, so an exported partial report cannot be mistaken for a complete one.
 
 `scripts/benchmark_analyzer.py`, Linux sandbox, Python engine, medians:
 
-| Workload | Time | Notes |
+| Workload (Linux sandbox, Python engine, medians) | Time | Notes |
 | --- | --- | --- |
-| Cold analysis, 4,000 files / 21 folders | 92.37 ms | empty cache |
-| Warm analysis (cached folder sizes) | 54.80 ms | **1.69×** from the cache |
-| Forced refresh | 93.70 ms | cache bypassed |
-| Cold analysis, `/usr/share` (3,702 files, 1,171 folders) | ~391 ms | 420 symlinks skipped |
-| Warm analysis, `/usr/share` | ~152 ms | **2.57×** from the cache |
+| Cold analysis, `/usr/share` (3,702 files, 1,171 folders) | 172.65 ms | empty cache, 420 symlinks skipped |
+| Warm analysis, `/usr/share` | 75.98 ms | **2.27×** from the cache |
+| Forced refresh, `/usr/share` | 92.67 ms | cache bypassed |
+| Cold analysis, 1,617 folders (synthetic, folder-heavy) | 234.15 ms | empty cache |
+| Warm analysis, 1,617 folders | 90.67 ms | **2.58×** |
+| Cold/warm, `/usr/lib/python3.11` (94 folders) | 40.05 → 13.95 ms | **2.87×** |
+| Folder scaling, 250 → 2,000 folders | 24.4 → 187 ms | near-linear (was 43.7 → 364 ms) |
 
-Warm runs still enumerate every directory to collect file records - only the
-recursive folder sizes come from the cache. That is deliberate: file-level
-statistics with bounded memory beat a second, unverified quick path. Reproduce on
-Windows:
+The folder-scaling row is the regression guard: before the fix, every folder's
+recursive size re-walked its subtree, so cost grew with folders × tree.
+
+Reproduce on Windows:
 
 ```powershell
 py scripts/benchmark_analyzer.py --synthetic --files 20000 --folders 40 --repeats 3
+py scripts/benchmark_analyzer.py --folder-heavy --folders 2000 --repeats 3
 py scripts/benchmark_analyzer.py --path $HOME\Downloads --repeats 3
 ```
 
@@ -311,5 +351,6 @@ _rust_scanner.calculate_size(path, token, follow_links=False, reparse_mounts=Fal
 - Screenshot export defaults to PNG; press F2 to configure PNG, SVG, or JPEG and Ctrl+Shift+S to save under the user's data directory.
 - Application settings and structured JSONL logs are stored per-user (`%LOCALAPPDATA%\DiskExplorerCleaner` on Windows; `$XDG_DATA_HOME/disk-explorer-cleaner` or `~/.local/share/disk-explorer-cleaner` elsewhere).
 - SQLite hybrid caching is implemented (`src/disk_explorer/cache/`): directory listings and recursive folder sizes are cached separately, validated by metadata + TTL, and invalidated on manual refresh. See [docs/cache-schema.md](docs/cache-schema.md).
-- Disk Analyzer is implemented (`src/disk_explorer/analyzer/`): largest files, largest folders, extension statistics, storage overview, filters and CSV export, built on the scanner and the hybrid cache.
+- Disk Analyzer is implemented (`src/disk_explorer/analyzer/`): largest files, largest folders, extension statistics, storage overview, filters and CSV export, built on the scanner and the hybrid cache. Folder totals come from a single walk, listings and totals are both cached, and the Visuals tab renders a treemap, a ring chart and bars with no third-party charting dependency.
+- Explorer sorting: press **`o`** to step through Name → Size → Modified → Type, **`shift+o`** to reverse, or click a column header. Folders stay grouped above files in every order, unknown sizes sort last in both directions, and sorting by size keeps re-ordering rows as folder sizes arrive.
 - Search and cleanup/deletion are later milestones and are not implemented yet.

@@ -29,6 +29,67 @@ from disk_explorer.models.skip_reason import SkipReason
 
 _CACHE_ERRORS = (CacheUnavailable, sqlite3.Error)
 
+#: Columns every size query selects, in the order ``_size_record_from_row`` unpacks.
+_SIZE_COLUMNS = (
+    "path_key, path, created_at, ttl_seconds, mtime_ns, total_size, total_files, "
+    "total_directories, scanned_entries, skipped_count, skipped, is_complete, errors"
+)
+
+#: One statement for single and batched writes, so they can never drift apart.
+_LISTING_INSERT = """
+    INSERT INTO listings
+        (path_key, path, created_at, ttl_seconds, mtime_ns,
+         entry_count, skipped_count, payload, skipped)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(path_key) DO UPDATE SET
+        path=excluded.path,
+        created_at=excluded.created_at,
+        ttl_seconds=excluded.ttl_seconds,
+        mtime_ns=excluded.mtime_ns,
+        entry_count=excluded.entry_count,
+        skipped_count=excluded.skipped_count,
+        payload=excluded.payload,
+        skipped=excluded.skipped
+"""
+
+
+def _listing_payload(listing: DirectoryListing, ttl_seconds: float) -> tuple | None:
+    """Row values for a listing, or ``None`` when it must not be cached.
+
+    Only complete listings are stored: a cache hit must never resurrect a partial
+    scan as if it were a successful one.
+    """
+    if not listing.is_complete or listing.cancelled or listing.errors:
+        return None
+    root_mtime = mtime_ns(listing.root)
+    if root_mtime is None:
+        return None
+    payload = json.dumps(
+        [
+            [
+                entry.name,
+                entry.is_directory,
+                entry.size,
+                entry.modified_ns,
+                entry.extension,
+                entry.is_symlink,
+                entry.is_reparse_point,
+            ]
+            for entry in listing.entries
+        ]
+    )
+    return (
+        path_key(listing.root),
+        str(listing.root),
+        time.time(),
+        ttl_seconds,
+        root_mtime,
+        len(listing.entries),
+        listing.skipped_entries,
+        payload,
+        _skip_payload(listing.skipped_details),
+    )
+
 
 @dataclass(slots=True, frozen=True)
 class SizeRecord:
@@ -106,61 +167,13 @@ class CacheRepository:
 
     # -- listings ----------------------------------------------------------
     def store_listing(self, listing: DirectoryListing) -> bool:
-        """Store a directory listing.
-
-        Only complete results are stored. Cancelled, partial or errored listings
-        are skipped: a cache hit must never resurrect a partial scan as if it were
-        a successful one.
-        """
-        if not listing.is_complete or listing.cancelled or listing.errors:
+        """Store a single directory listing (see :func:`_listing_payload`)."""
+        payload = _listing_payload(listing, self.ttl_seconds)
+        if payload is None:
             return False
-        root_mtime = mtime_ns(listing.root)
-        if root_mtime is None:
-            return False
-        payload = json.dumps(
-            [
-                [
-                    entry.name,
-                    entry.is_directory,
-                    entry.size,
-                    entry.modified_ns,
-                    entry.extension,
-                    entry.is_symlink,
-                    entry.is_reparse_point,
-                ]
-                for entry in listing.entries
-            ]
-        )
         try:
             with self.database.transaction(write=True) as connection:
-                connection.execute(
-                    """
-                    INSERT INTO listings
-                        (path_key, path, created_at, ttl_seconds, mtime_ns,
-                         entry_count, skipped_count, payload, skipped)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(path_key) DO UPDATE SET
-                        path=excluded.path,
-                        created_at=excluded.created_at,
-                        ttl_seconds=excluded.ttl_seconds,
-                        mtime_ns=excluded.mtime_ns,
-                        entry_count=excluded.entry_count,
-                        skipped_count=excluded.skipped_count,
-                        payload=excluded.payload,
-                        skipped=excluded.skipped
-                    """,
-                    (
-                        path_key(listing.root),
-                        str(listing.root),
-                        time.time(),
-                        self.ttl_seconds,
-                        root_mtime,
-                        len(listing.entries),
-                        listing.skipped_entries,
-                        payload,
-                        _skip_payload(listing.skipped_details),
-                    ),
-                )
+                connection.execute(_LISTING_INSERT, payload)
             return True
         except _CACHE_ERRORS as error:
             self._warn("cache-write-listing", error)
@@ -234,6 +247,104 @@ class CacheRepository:
             ),
             validation,
         )
+
+    def load_listings(
+        self, paths: list[str | Path], policy: CachePolicy, now: float | None = None
+    ) -> dict[str, DirectoryListing]:
+        """Load and validate many directory listings in one sweep.
+
+        The Analyzer needs every folder's entries; one query per folder would turn
+        a fast cache into the bottleneck. Each row is still validated on its own,
+        so an expired or stale listing is absent from the result rather than
+        returned as if it were current.
+        """
+        found: dict[str, DirectoryListing] = {}
+        if not paths:
+            return found
+        reference = time.time() if now is None else now
+        keyed = {path_key(path): Path(path) for path in paths}
+        keys = list(keyed)
+        chunk_size = 200
+        for start in range(0, len(keys), chunk_size):
+            chunk = keys[start : start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            try:
+                rows = self.database.fetch_all(
+                    f"""
+                    SELECT path_key, path, created_at, ttl_seconds, mtime_ns, payload, skipped
+                    FROM listings WHERE path_key IN ({placeholders})
+                    """,
+                    tuple(chunk),
+                )
+            except _CACHE_ERRORS as error:
+                self._warn("cache-read-listings", error)
+                return found
+            for key, raw_path, created_at, row_ttl, stored_mtime, payload, skipped in rows:
+                root = Path(raw_path)
+                validation = policy.validate(
+                    created_at=created_at,
+                    row_ttl_seconds=row_ttl,
+                    stored_mtime_ns=stored_mtime,
+                    current_mtime_ns=mtime_ns(root),
+                    kind="listing",
+                    now=reference,
+                )
+                if not validation.is_valid:
+                    continue
+                try:
+                    entries = [
+                        FileEntry(
+                            path=root / name,
+                            name=name,
+                            is_directory=is_directory,
+                            size=size,
+                            modified_ns=modified_ns,
+                            extension=extension,
+                            scan_status=ScanStatus.CACHED if is_directory else ScanStatus.COMPLETE,
+                            is_symlink=is_symlink,
+                            is_reparse_point=is_reparse,
+                        )
+                        for (
+                            name,
+                            is_directory,
+                            size,
+                            modified_ns,
+                            extension,
+                            is_symlink,
+                            is_reparse,
+                        ) in json.loads(payload)
+                    ]
+                except (ValueError, TypeError) as error:
+                    self._warn("cache-decode-listing", error)
+                    continue
+                details = _skip_details(skipped)
+                found[key] = DirectoryListing(
+                    root=root,
+                    entries=entries,
+                    scanned_entries=len(entries),
+                    skipped_entries=len(details),
+                    is_complete=True,
+                    cancelled=False,
+                    skipped_details=details,
+                )
+        return found
+
+    def store_listings(self, listings: list[DirectoryListing]) -> int:
+        """Store many complete listings in one transaction; returns rows written."""
+        payloads = [
+            payload
+            for payload in (_listing_payload(listing, self.ttl_seconds) for listing in listings)
+            if payload is not None
+        ]
+        if not payloads:
+            return 0
+        try:
+            with self.database.transaction(write=True) as connection:
+                connection.executemany(_LISTING_INSERT, payloads)
+            return len(payloads)
+        except _CACHE_ERRORS as error:
+            self._warn("cache-write-listings", error)
+            return 0
 
     def listing_mtimes(self, since: float, prefix: str) -> list[tuple[str, int | None]]:
         """Cached child listings written at or after ``since`` under ``prefix``."""
@@ -322,10 +433,8 @@ class CacheRepository:
         root = Path(path)
         try:
             row = self.database.fetch_one(
-                """
-                SELECT created_at, ttl_seconds, mtime_ns, total_size, total_files,
-                       total_directories, scanned_entries, skipped_count, skipped,
-                       is_complete, errors
+                f"""
+                SELECT {_SIZE_COLUMNS}
                 FROM sizes WHERE path_key = ?
                 """,
                 (path_key(root),),
@@ -335,7 +444,62 @@ class CacheRepository:
             return None, Validation(ValidationStatus.UNCACHEABLE, str(error))
         if row is None:
             return None, Validation(ValidationStatus.UNCACHEABLE, "no cached size")
+        reference = time.time() if now is None else now
+        record = self._size_record_from_row(row, policy, reference)
+        if record is None:
+            # Re-validate only to report why: the row exists but is not usable.
+            validation = policy.validate(
+                created_at=row[2],
+                row_ttl_seconds=row[3],
+                stored_mtime_ns=row[4],
+                current_mtime_ns=mtime_ns(root),
+                kind="size",
+                now=reference,
+            )
+            return None, validation
+        return record, Validation(ValidationStatus.OK, "size unchanged and within TTL")
+
+    def load_size_records(
+        self, keys: list[str], policy: CachePolicy, now: float | None = None
+    ) -> dict[str, SizeRecord]:
+        """Load and validate many size rows in one query per chunk.
+
+        Chunked to stay well under SQLite's bound-parameter limit. Invalid or
+        expired rows are simply absent from the result, so a caller can never
+        mistake a stale row for a fresh one.
+        """
+        found: dict[str, SizeRecord] = {}
+        if not keys:
+            return found
+        reference = time.time() if now is None else now
+        chunk_size = 400
+        for start in range(0, len(keys), chunk_size):
+            chunk = keys[start : start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            try:
+                rows = self.database.fetch_all(
+                    f"""
+                    SELECT {_SIZE_COLUMNS}
+                    FROM sizes WHERE path_key IN ({placeholders})
+                    """,
+                    tuple(chunk),
+                )
+            except _CACHE_ERRORS as error:
+                self._warn("cache-read-sizes", error)
+                return found
+            for row in rows:
+                record = self._size_record_from_row(row, policy, reference)
+                if record is not None:
+                    found[record.path_key] = record
+        return found
+
+    def _size_record_from_row(
+        self, row: tuple, policy: CachePolicy, reference: float
+    ) -> SizeRecord | None:
+        """Validate one raw row and build its record, or ``None`` when unusable."""
         (
+            key,
+            raw_path,
             created_at,
             row_ttl,
             stored_mtime,
@@ -348,43 +512,40 @@ class CacheRepository:
             is_complete,
             errors,
         ) = row
+        root = Path(raw_path)
         validation = policy.validate(
             created_at=created_at,
             row_ttl_seconds=row_ttl,
             stored_mtime_ns=stored_mtime,
             current_mtime_ns=mtime_ns(root),
             kind="size",
-            now=time.time() if now is None else now,
+            now=reference,
         )
         if not validation.is_valid:
-            return None, validation
+            return None
         try:
             stored_errors = [str(line) for line in json.loads(errors or "[]")]
         except (ValueError, TypeError):
             stored_errors = ["cached error list was unreadable"]
         complete = bool(is_complete) and not stored_errors
-        result = ScanResult(
-            root=root,
-            total_size=int(total_size),
-            total_files=int(total_files),
-            total_directories=int(total_directories),
-            scanned_entries=int(scanned_entries),
-            skipped_entries=int(skipped_count),
-            errors=stored_errors,
-            is_complete=complete,
-            cancelled=False,
-            skipped_details=_skip_details(skipped),
-        )
-        return (
-            SizeRecord(
-                result=result,
-                path_key=path_key(root),
-                created_at=created_at,
-                mtime_ns=stored_mtime,
-                ttl_seconds=float(row_ttl or 0.0),
+        return SizeRecord(
+            result=ScanResult(
+                root=root,
+                total_size=int(total_size),
+                total_files=int(total_files),
+                total_directories=int(total_directories),
+                scanned_entries=int(scanned_entries),
+                skipped_entries=int(skipped_count),
+                errors=stored_errors,
                 is_complete=complete,
+                cancelled=False,
+                skipped_details=_skip_details(skipped),
             ),
-            validation,
+            path_key=key,
+            created_at=created_at,
+            mtime_ns=stored_mtime,
+            ttl_seconds=float(row_ttl or 0.0),
+            is_complete=complete,
         )
 
     # -- invalidation ------------------------------------------------------

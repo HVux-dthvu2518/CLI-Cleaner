@@ -345,7 +345,13 @@ async def test_max_size_filter(tmp_path: Path) -> None:
 
 # -- cache integration ----------------------------------------------------
 @pytest.mark.asyncio
-async def test_folder_sizes_are_reused_from_the_cache(tmp_path: Path, cache: CacheService) -> None:
+async def test_analysis_never_rescans_subtrees(tmp_path: Path, cache: CacheService) -> None:
+    """Totals come from the single walk, so no folder is ever re-walked.
+
+    Regression guard for the M3 performance bug: asking the scanner for every
+    folder's recursive size while walking is O(folders x tree) and took ~15 s on a
+    16k-folder tree.
+    """
     root = tmp_path / "scope"
     root.mkdir()
     _build_tree(root)
@@ -353,11 +359,90 @@ async def test_folder_sizes_are_reused_from_the_cache(tmp_path: Path, cache: Cac
     service = AnalyzerService(scanner, cache)
 
     await service.analyze(root)
-    first = scanner.size_calculations
-    await service.analyze(root)
 
-    assert first == 4  # root + media + docs + deep
-    assert scanner.size_calculations == first  # second pass served from the cache
+    directories = 4  # scope, media, docs, deep
+    assert scanner.enumerations == directories  # one listing per folder
+    assert scanner.size_calculations == 0  # no recursive re-walks at all
+
+
+@pytest.mark.asyncio
+async def test_totals_are_written_to_the_cache_for_reuse(tmp_path: Path, cache: CacheService) -> None:
+    root = tmp_path / "scope"
+    root.mkdir()
+    _build_tree(root)
+    service = AnalyzerService(FileSystemScanner(), cache)
+
+    snapshot = await service.analyze(root)
+
+    cached = cache.cached_size(root)
+    assert cached is not None
+    assert cached.total_size == snapshot.total_size
+    assert cached.is_complete is True
+
+
+@pytest.mark.asyncio
+async def test_warm_run_reads_listings_instead_of_the_filesystem(
+    tmp_path: Path, cache: CacheService
+) -> None:
+    """A cache hit must mean "did not enumerate", not "enumerated and ignored it"."""
+    root = tmp_path / "scope"
+    root.mkdir()
+    _build_tree(root)
+    scanner = CountingScanner()
+    service = AnalyzerService(scanner, cache)
+
+    await service.analyze(root)
+    cold = scanner.enumerations
+    second = await service.analyze(root)
+
+    assert cold == 4  # scope, media, docs, deep
+    assert scanner.enumerations == cold  # not one extra directory listing
+    assert second.cached_directories == 4
+    assert second.from_cache is True
+    assert second.summary_line().endswith("folders cached") or "folders cached" in second.summary_line()
+
+
+@pytest.mark.asyncio
+async def test_warm_run_reports_the_same_totals(tmp_path: Path, cache: CacheService) -> None:
+    root = tmp_path / "scope"
+    root.mkdir()
+    _build_tree(root)
+    service = AnalyzerService(FileSystemScanner(), cache)
+
+    cold = await service.analyze(root)
+    warm = await service.analyze(root)
+
+    assert (warm.total_size, warm.total_files, warm.total_directories) == (
+        cold.total_size,
+        cold.total_files,
+        cold.total_directories,
+    )
+    assert [record.path for record in warm.largest_files] == [
+        record.path for record in cold.largest_files
+    ]
+    assert warm.status is SnapshotStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_changed_folder_is_not_served_from_the_cache(
+    tmp_path: Path, cache: CacheService
+) -> None:
+    """A new file must be picked up: a stale listing is a miss, not a hit."""
+    root = tmp_path / "scope"
+    root.mkdir()
+    _build_tree(root)
+    service = AnalyzerService(FileSystemScanner(), cache)
+    first = await service.analyze(root)
+
+    (root / "docs" / "new.bin").write_bytes(b"n" * 5_000)
+    # Some filesystems have coarse timestamps; this test is about stale detection.
+    stamp = (root / "docs").stat().st_mtime_ns
+    os.utime(root / "docs", ns=(stamp + 5_000_000_000, stamp + 5_000_000_000))
+    second = await service.analyze(root)
+
+    assert second.total_size == first.total_size + 5_000
+    assert second.total_files == first.total_files + 1
+    assert second.cached_directories < second.total_directories
 
 
 @pytest.mark.asyncio
@@ -369,14 +454,18 @@ async def test_force_refresh_ignores_cached_sizes(tmp_path: Path, cache: CacheSe
     service = AnalyzerService(scanner, cache)
 
     await service.analyze(root)
-    first = scanner.size_calculations
+    before = scanner.enumerations
     await service.analyze(root, force_refresh=True)
 
-    assert scanner.size_calculations == first * 2  # every folder rescanned
+    assert scanner.enumerations == before + 4  # every folder re-read from disk
+    snapshot = await service.analyze(root, force_refresh=True)
+    assert snapshot.cached_directories == 0
 
 
 @pytest.mark.asyncio
-async def test_partial_results_are_cached_and_stay_labelled(tmp_path: Path, cache: CacheService) -> None:
+async def test_partial_subtrees_are_never_cached_as_complete(
+    tmp_path: Path, cache: CacheService
+) -> None:
     root = tmp_path / "scope"
     root.mkdir()
     _build_tree(root)
@@ -389,14 +478,18 @@ async def test_partial_results_are_cached_and_stay_labelled(tmp_path: Path, cach
         pytest.skip("cannot change permissions here")
     try:
         snapshot = await AnalyzerService(FileSystemScanner(), cache).analyze(root)
-        cached = cache.cached_size(root)
+        root_row = cache.cached_size(root)
+        blocked_row = cache.cached_size(blocked)
     finally:
         os.chmod(blocked, 0o755)
 
     assert snapshot.status is SnapshotStatus.PARTIAL
-    assert cached is not None  # the expensive case is cacheable even when partial
-    assert cached.is_complete is False
-    assert cached.errors
+    # The report says so...
+    blocked_record = next(record for record in snapshot.largest_folders if record.name == "blocked")
+    assert blocked_record.is_complete is False
+    # ...and an incomplete subtree is not published as a complete cache row.
+    assert blocked_row is None or blocked_row.is_complete is False
+    assert root_row is None or root_row.is_complete is False or root_row.errors
 
 
 @pytest.mark.asyncio
