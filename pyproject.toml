@@ -7,7 +7,7 @@ name = "disk-explorer-cleaner"
 version = "0.2.0"
 description = "A performance-oriented Windows disk explorer with a Rust scanning engine."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = ["textual>=0.70,<2"]
 
 [project.optional-dependencies]

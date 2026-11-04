@@ -15,12 +15,15 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Button, DataTable, Footer, Header, Input, Static, TabbedContent, TabPane
 
 from disk_explorer.config import AppConfig, load_config, save_config, user_data_dir
+from disk_explorer.core.scanner import FileSystemScanner
 from disk_explorer.infrastructure.logging import configure_logging
-from disk_explorer.models.file_entry import FileEntry, ScanStatus
-from disk_explorer.models.scan_result import ScanResult
+from disk_explorer.models.file_entry import FileEntry
+from disk_explorer.models.scan_result import ScanResult, SkippedEntry
+from disk_explorer.models.skip_reason import SKIP_REASON_DETAIL, SkipReason
 from disk_explorer.services.scan_service import ScanService
 from disk_explorer.services.screenshot_service import save_screenshot
 from disk_explorer.ui.screens.settings_screen import SettingsScreen
+from disk_explorer.ui.screens.skipped_entries_screen import SkippedEntriesScreen
 
 
 def _format_size(size: int | None) -> str:
@@ -58,6 +61,7 @@ class DiskExplorerApp(App[None]):
         Binding("ctrl+l", "focus_location", "Path"),
         Binding("space", "toggle_select", "Select"),
         Binding("ctrl+a", "select_all", "Select all", show=False),
+        Binding("s", "show_skipped", "Skipped"),
         Binding("f2", "open_settings", "Settings"),
         Binding("ctrl+shift+s", "export_screenshot", "Screenshot"),
         Binding("q", "quit", "Quit"),
@@ -67,7 +71,13 @@ class DiskExplorerApp(App[None]):
         super().__init__()
         self.config: AppConfig = load_config()
         self.logger = configure_logging()
-        self.scan_service = ScanService(max_workers=self.config.max_workers)
+        self.scan_service = ScanService(
+            max_workers=self.config.max_workers,
+            scanner=FileSystemScanner(
+                follow_links=self.config.follow_links,
+                reparse_mounts=self.config.reparse_mounts,
+            ),
+        )
         self.current_path = Path.home()
         self._entries: list[FileEntry] = []
         self._entries_by_path: dict[str, FileEntry] = {}
@@ -84,6 +94,9 @@ class DiskExplorerApp(App[None]):
         self._scan_partial = False
         self._listing_partial = False
         self._volume_summary = ""
+        self._listing_skipped: list[SkippedEntry] = []
+        self._size_skipped: list[SkippedEntry] = []
+        self._listing_errors: list[str] = []
         self.logger.info("Application started", extra={"operation": "startup", "result": "ok"})
 
     def compose(self) -> ComposeResult:
@@ -268,6 +281,9 @@ class DiskExplorerApp(App[None]):
         self._scan_partial = False
         self._listing_partial = False
         self._volume_summary = ""
+        self._listing_skipped: list[SkippedEntry] = []
+        self._size_skipped: list[SkippedEntry] = []
+        self._listing_errors: list[str] = []
         self._query_base("#details", Static).update("Select a file or folder to inspect its details.")
         self._set_status(f"Reading with {self.scan_service.engine_name.title()} engine · {self.current_path}…")
         self._query_base("#listing-summary", Static).update("Reading directory…")
@@ -307,13 +323,15 @@ class DiskExplorerApp(App[None]):
         self._scan_total = sum(entry.is_directory for entry in self._entries)
         self._scan_errors = len(listing.errors)
         self._scan_skipped = listing.skipped_entries
+        self._listing_skipped = list(listing.skipped_details)
+        self._listing_errors = list(listing.errors)
         self._listing_partial = not listing.is_complete
         await self._update_volume_summary(path, navigation_id)
         self._update_listing_summary(False)
-        if listing.errors:
+        for line in listing.errors[:5]:
             self.logger.warning(
-                "Directory listing was incomplete",
-                extra={"operation": "enumerate", "target": str(path), "result": "partial"},
+                "Unreadable entry",
+                extra={"operation": "enumerate", "target": line, "result": "error"},
             )
         if not listing.is_complete and not self._entries:
             self._set_status(f"Could not read directory · {len(listing.errors)} error(s) · {path}", error=True)
@@ -340,9 +358,10 @@ class DiskExplorerApp(App[None]):
             self._update_listing_summary(True)
             state = "partial" if self._listing_partial or self._scan_partial or self._scan_errors else "complete"
             suffix = f" · {self._scan_errors} error(s)" if self._scan_errors else ""
-            skipped = f" · {self._scan_skipped} link/entry(s) skipped" if self._scan_skipped else ""
+            skipped = f" · {self._scan_skipped} skipped ({self._skip_summary()})" if self._scan_skipped else ""
+            hint = " · press s for details" if self._scan_skipped or self._scan_errors else ""
             self._set_status(
-                f"{self.scan_service.engine_name.title()} scan {state}{suffix}{skipped} · "
+                f"{self.scan_service.engine_name.title()} scan {state}{suffix}{skipped}{hint} · "
                 f"{len(self._entries)} items · {self.current_path}",
                 error=state == "partial",
             )
@@ -356,6 +375,17 @@ class DiskExplorerApp(App[None]):
         self._scan_errors += len(result.errors)
         self._scan_skipped += result.skipped_entries
         self._scan_partial = self._scan_partial or not result.is_complete
+        if result.skipped_details:
+            self._size_skipped.extend(result.skipped_details)
+        unreadable = [
+            line
+            for line in result.errors
+            if "Permission denied" in line or "Access is denied" in line or "being used" in line
+        ]
+        for line in unreadable[:3]:
+            self.logger.warning(
+                "Unreadable location", extra={"operation": "calculate-size", "target": line, "result": "error"}
+            )
         self._pending_size_updates[key] = (entry, result)
         now = asyncio.get_running_loop().time()
         if now - self._last_ui_refresh >= 0.1:
@@ -395,7 +425,8 @@ class DiskExplorerApp(App[None]):
             f"Scan: {entry.scan_status.value.title()}",
         ]
         if entry.is_symlink or entry.is_reparse_point:
-            details.append("Link/reparse point: not traversed")
+            reason = SkipReason.REPARSE_POINT if entry.is_reparse_point else SkipReason.SYMLINK
+            details.append(f"Not traversed: {SKIP_REASON_DETAIL[reason]}")
         if result is not None:
             details.extend(
                 [
@@ -404,8 +435,10 @@ class DiskExplorerApp(App[None]):
                     f"Skipped: {result.skipped_entries:,}",
                 ]
             )
+            if result.skipped_details:
+                details.append(f"Skipped by design: {result.skipped_summary}")
             if result.errors:
-                details.append(f"Errors: {len(result.errors)}")
+                details.append(f"Unreadable: {len(result.errors)} (press s to review)")
         self._query_base("#details", Static).update("\n\n".join(details))
 
     async def _update_volume_summary(self, path: Path, navigation_id: int) -> None:
@@ -430,9 +463,24 @@ class DiskExplorerApp(App[None]):
         else:
             state = f"Folder sizes {self._scan_done}/{self._scan_total}"
         volume = f"  ·  {self._volume_summary}" if self._volume_summary else ""
+        skipped = f"  ·  {self._scan_skipped} skipped (s)" if self._scan_skipped else ""
         self._query_base("#listing-summary", Static).update(
-            f"{folder_count} folders  ·  {file_count} files  ·  {state}{volume}"
+            f"{folder_count} folders  ·  {file_count} files  ·  {state}{skipped}{volume}"
         )
+
+    def _skip_summary(self) -> str:
+        counts: dict[SkipReason, int] = {}
+        for item in (*self._listing_skipped, *self._size_skipped):
+            counts[item.reason] = counts.get(item.reason, 0) + 1
+        ordered = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0].value))
+        return ", ".join(f"{count} {reason.value}" for reason, count in ordered)
+
+    def action_show_skipped(self) -> None:
+        """Open the read-only report explaining every excluded entry."""
+        combined = [*self._listing_skipped, *self._size_skipped]
+        blocked = [line for result in self._size_results.values() for line in result.errors]
+        blocked.extend(self._listing_errors)
+        self.push_screen(SkippedEntriesScreen(self.current_path, combined, blocked))
 
     def _query_base(self, selector: str, expected_type: type):
         """Query the main workspace even while a modal screen is open."""
