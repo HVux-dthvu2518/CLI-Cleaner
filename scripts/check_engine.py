@@ -28,10 +28,23 @@ if importlib.util.find_spec("disk_explorer") is None:
     sys.path.insert(0, str(ROOT / "src"))
 
 from disk_explorer import __version__  # noqa: E402
+from disk_explorer.analyzer import AnalyzerService  # noqa: E402
 from disk_explorer.cache import CacheService, Database, describe as describe_schema  # noqa: E402
 from disk_explorer.config import cache_database_path, load_config, user_data_dir  # noqa: E402
 from disk_explorer.core import scanner as scanner_module  # noqa: E402
 from disk_explorer.core.scanner import FileSystemScanner  # noqa: E402
+
+
+def _analyzer_fixture() -> Path:
+    """Two files in two folders: enough to prove the analyzer collects data."""
+    folder = Path(tempfile.mkdtemp(prefix="disk-explorer-analyzer-")) / "fixture"
+    (folder / "docs").mkdir(parents=True)
+    (folder / "docs" / "a.txt").write_bytes(b"a" * 10)
+    (folder / "b.bin").write_bytes(b"b" * 20)
+    return folder
+
+
+_ANALYZER_FIXTURE = _analyzer_fixture()
 
 
 def _line(label: str, value: object) -> None:
@@ -166,6 +179,29 @@ def report_cache() -> list[str]:
     return problems
 
 
+def report_analyzer() -> list[str]:
+    """Verify the Disk Analyzer works on this machine, on one small tree."""
+    scanner = FileSystemScanner()
+    service = AnalyzerService(scanner)
+    try:
+        snapshot = service.analyze_sync(_ANALYZER_FIXTURE, top_files=5, top_folders=3)
+    except Exception as error:  # noqa: BLE001 - reported, not raised
+        return [f"The Disk Analyzer failed on a small test tree: {error}"]
+    _line("Analyzer status", snapshot.status.label)
+    _line("Analyzer totals", f"{snapshot.total_files} files / {snapshot.total_size:,} B")
+    problems: list[str] = []
+    if snapshot.status.value == "failed":
+        problems.append("The Disk Analyzer could not analyse a temporary tree; check the errors above.")
+    elif snapshot.total_files != 2:
+        problems.append(
+            f"The Disk Analyzer found {snapshot.total_files} files in a fixture with 2; "
+            "file collection may be broken."
+        )
+    if snapshot.status.value == "partial":
+        _line("Analyzer warning", "partial result (unreadable paths or limits)")
+    return problems
+
+
 def report_selftest() -> list[str]:
     """Scan a tiny tree that includes a link, and explain the outcome."""
     with tempfile.TemporaryDirectory() as temporary:
@@ -211,6 +247,8 @@ def main() -> int:
     problems += report_traversal()
     print("\n== Hybrid cache ==")
     problems += report_cache()
+    print("\n== Disk Analyzer ==")
+    problems += report_analyzer()
     if args.selftest:
         print("\n== Self-test ==")
         problems += report_selftest()
