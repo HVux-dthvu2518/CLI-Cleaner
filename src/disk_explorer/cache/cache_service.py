@@ -133,6 +133,70 @@ class CacheService:
         self._trace("listing-hit", path, validation)
         return listing
 
+    def cached_listings(self, paths: list[Path]) -> dict[str, DirectoryListing]:
+        """Fetch many validated listings in one sweep, keyed by :func:`path_key`.
+
+        Rows that are missing, expired or stale are absent. A hit means the entries
+        were read from disk earlier and are still trustworthy, so the caller can
+        avoid touching the filesystem for that folder entirely - which is what a
+        cache hit is supposed to mean.
+        """
+        started = time.perf_counter()
+        wanted = {path_key(path): path for path in paths}
+        if not self.database.available or not wanted:
+            return {}
+        for key in list(wanted):
+            if key in self._invalidated:
+                wanted.pop(key)
+        if not wanted:
+            return {}
+        rows = self.repository.load_listings(list(wanted), self.policy)
+        for key, listing in rows.items():
+            listing.from_cache = True
+            self.stats.listing_hits += 1
+        self.stats.listing_misses += len(wanted) - len(rows)
+        if rows:
+            self.stats.hit_durations.append(time.perf_counter() - started)
+            self.stats.last_miss_reason = ""
+        return rows
+
+    def store_listings(self, listings: list[DirectoryListing]) -> int:
+        """Persist many listings at once; returns how many rows were written."""
+        if not self.database.available or not listings:
+            return 0
+        stored = self.repository.store_listings(listings)
+        for listing in listings:
+            key = path_key(listing.root)
+            if key in self._invalidated:
+                self._invalidated.discard(key)
+        return stored
+
+    def cached_sizes(self, paths: list[Path]) -> dict[str, ScanResult]:
+        """Validate many folder totals in one query, keyed by :func:`path_key`.
+
+        The Analyzer asks about thousands of folders; one query per folder turns a
+        fast cache into a bottleneck. Only rows that pass validation come back, and
+        this never raises.
+        """
+        wanted = {path_key(path): path for path in paths}
+        if not self.database.available or not wanted:
+            return {}
+        for key in list(wanted):
+            if key in self._invalidated:
+                wanted.pop(key)
+        if not wanted:
+            return {}
+        rows = self.repository.load_size_records(list(wanted), self.policy)
+        found: dict[str, ScanResult] = {}
+        for key, record in rows.items():
+            record.result.from_cache = True
+            found[key] = record.result
+            self.stats.size_hits += 1
+            if not record.result.is_complete:
+                self.stats.partial_hits += 1
+        self.stats.size_misses += len(wanted) - len(rows)
+        return found
+
     def cached_size(self, path: str | Path, *, cross_check_children: bool = False) -> ScanResult | None:
         """Return a cached recursive size only if it is still trustworthy.
 

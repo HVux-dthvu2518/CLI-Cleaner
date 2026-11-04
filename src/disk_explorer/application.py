@@ -8,6 +8,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -52,6 +53,37 @@ def _status_label(status: ScanStatus) -> str:
     return _STATUS_LABELS.get(status, status.value.title())
 
 
+class _Reverse:
+    """Compare the opposite way, so descending sorts can keep folders on top."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value) -> None:
+        self.value = value
+
+    def __lt__(self, other: "_Reverse") -> bool:  # type: ignore[override]
+        return other.value < self.value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Reverse) and other.value == self.value
+
+
+class _Descending(int):
+    """An int that sorts backwards.
+
+    Used inside tuple sort keys where negation is not possible without breaking the
+    "unknown values last in both directions" rule that precedes it.
+    """
+
+    __slots__ = ()
+
+    def __lt__(self, other: int) -> bool:  # type: ignore[override]
+        return int.__gt__(self, other)
+
+    def __gt__(self, other: int) -> bool:  # type: ignore[override]
+        return int.__lt__(self, other)
+
+
 def _format_size(size: int | None) -> str:
     if size is None:
         return "—"
@@ -88,6 +120,8 @@ class DiskExplorerApp(App[None]):
         Binding("space", "toggle_select", "Select"),
         Binding("ctrl+a", "select_all", "Select all", show=False),
         Binding("s", "show_skipped", "Skipped"),
+        Binding("o", "cycle_sort", "Sort"),
+        Binding("shift+o", "reverse_sort", "Reverse"),
         Binding("f2", "open_settings", "Settings"),
         Binding("ctrl+shift+s", "export_screenshot", "Screenshot"),
         Binding("q", "quit", "Quit"),
@@ -126,6 +160,9 @@ class DiskExplorerApp(App[None]):
         self._size_skipped: list[SkippedEntry] = []
         self._listing_errors: list[str] = []
         self._refresh_requested = False
+        #: Explorer ordering: which column, and which direction.
+        self.sort_key = "name"
+        self.sort_descending = False
         self.logger.info("Application started", extra={"operation": "startup", "result": "ok"})
 
     def _build_cache_service(self) -> CacheService | None:
@@ -194,6 +231,7 @@ class DiskExplorerApp(App[None]):
         table.add_column("Size", key="size", width=14)
         table.add_column("Modified", key="modified", width=18)
         table.add_column("Status", key="scan-status", width=13)
+        self._label_sort_columns()
         table.focus()
         self._apply_responsive_layout()
         self._navigate_to(self.current_path)
@@ -294,6 +332,130 @@ class DiskExplorerApp(App[None]):
             table.update_cell(str(entry.path), "selected", "✓")
         self._set_status(f"Selected all {len(self._selected_paths)} visible item(s) · {self.current_path}")
 
+    # -- sorting -----------------------------------------------------------
+    SORT_COLUMNS: tuple[str, ...] = ("name", "size", "modified", "type")
+    SORT_LABELS = {"name": "Name", "size": "Size", "modified": "Modified", "type": "Type"}
+
+    def action_cycle_sort(self) -> None:
+        """Step through the sort columns: name -> size -> modified -> type."""
+        index = (self.SORT_COLUMNS.index(self.sort_key) + 1) % len(self.SORT_COLUMNS)
+        self.sort_by(self.SORT_COLUMNS[index], descending=index != 0)
+
+    def action_reverse_sort(self) -> None:
+        self.sort_by(self.sort_key, descending=not self.sort_descending)
+
+    def sort_by(self, column: str, descending: bool | None = None) -> None:
+        """Order the Explorer table, keeping folders above files.
+
+        The filesystem hands directories back in no particular order, so the table
+        needs a defined one. Folders stay grouped at the top for every column:
+        sorting by size is meant to answer "what is big in here", and a folder
+        buried in a run of files makes that harder to read.
+        """
+        if column not in self.SORT_COLUMNS:
+            return
+        self.sort_key = column
+        if descending is not None:
+            self.sort_descending = descending
+        self._entries = self._sorted_entries()
+        if self._mounted:
+            self._label_sort_columns()
+            self._rebuild_table()
+        arrow = "↓" if self.sort_descending else "↑"
+        self._set_status(
+            f"Sorted by {self.SORT_LABELS[column]} {arrow} · {len(self._entries)} items · {self.current_path}"
+        )
+
+    def _sorted_entries(self) -> list[FileEntry]:
+        """Entries in the selected order; unknown values sort last in both directions."""
+        descending = self.sort_descending
+
+        def name_of(entry: FileEntry) -> str:
+            return entry.name.casefold()
+
+        def type_of(entry: FileEntry) -> str:
+            return ("Folder" if entry.is_directory else (entry.extension or "File")).casefold()
+
+        def ordered(value):
+            return _Reverse(value) if descending else value
+
+        if self.sort_key == "size":
+            def key(entry: FileEntry):
+                # Unknown size is not zero: those rows always sink to the bottom.
+                size = entry.size
+                return (
+                    not entry.is_directory,
+                    size is None,
+                    _Descending(size or 0) if descending else (size or 0),
+                    name_of(entry),
+                )
+        elif self.sort_key == "modified":
+            def key(entry: FileEntry):
+                stamp = entry.modified_ns
+                return (
+                    not entry.is_directory,
+                    stamp is None,
+                    _Descending(stamp or 0) if descending else (stamp or 0),
+                    name_of(entry),
+                )
+        elif self.sort_key == "type":
+            def key(entry: FileEntry):
+                return (not entry.is_directory, ordered(type_of(entry)), name_of(entry))
+        else:
+            def key(entry: FileEntry):
+                return (not entry.is_directory, ordered(name_of(entry)), name_of(entry))
+
+        return sorted(self._entries, key=key)
+
+    def _label_sort_columns(self) -> None:
+        """Mark the active sort column with an arrow, so the order is never a guess."""
+        if not self._mounted:
+            return
+        table = self._query_base("#file-table", DataTable)
+        arrow = "↓" if self.sort_descending else "↑"
+        for column, label in self.SORT_LABELS.items():
+            table.columns[column].label = Text(f"{label} {arrow}" if column == self.sort_key else label)
+
+    def _rebuild_table(self) -> None:
+        """Repaint the table from ``self._entries``, keeping the highlighted row."""
+        table = self._query_base("#file-table", DataTable)
+        highlighted = None
+        if 0 <= table.cursor_row < len(self._entries):
+            highlighted = str(self._entries[table.cursor_row].path)
+        table.clear(columns=False)
+        for entry in self._entries:
+            key = str(entry.path)
+            measured = key in self._size_results
+            if entry.is_directory and not measured:
+                size_text, status_text = "Calculating…", "Pending"
+            else:
+                size_text, status_text = _format_size(entry.size), _status_label(entry.scan_status)
+            table.add_row(
+                "✓" if key in self._selected_paths else "",
+                entry.name,
+                "Folder" if entry.is_directory else (entry.extension or "File"),
+                size_text,
+                _format_modified(entry.modified_ns),
+                status_text,
+                key=key,
+            )
+        if highlighted is not None:
+            for row_index, entry in enumerate(self._entries):
+                if str(entry.path) == highlighted:
+                    table.move_cursor(row=row_index)
+                    break
+        self._update_listing_summary(False)
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        """Click a column header to sort by it; click the same header again to reverse."""
+        column = str(event.column_key.value)
+        if column not in self.SORT_COLUMNS:
+            return
+        if column == self.sort_key:
+            self.sort_by(column, descending=not self.sort_descending)
+        else:
+            self.sort_by(column, descending=column != "name")
+
     def action_open_settings(self) -> None:
         self.push_screen(SettingsScreen(self.config.screenshot_format), self._save_settings)
 
@@ -362,10 +524,8 @@ class DiskExplorerApp(App[None]):
         listing = await self.scan_service.enumerate_directory(path, refresh=refresh)
         if not self.is_running or navigation_id != self._navigation_id:
             return
-        self._entries = sorted(
-            listing.entries,
-            key=lambda item: (not item.is_directory, item.name.casefold()),
-        )
+        self._entries = list(listing.entries)
+        self._entries = self._sorted_entries()
         self._entries_by_path = {str(entry.path): entry for entry in self._entries}
         table = self._query_base("#file-table", DataTable)
         for index, entry in enumerate(self._entries):
@@ -460,6 +620,16 @@ class DiskExplorerApp(App[None]):
 
     def _flush_size_updates(self) -> None:
         if not self._mounted or not self.is_running or not self._pending_size_updates:
+            return
+        if self.sort_key == "size":
+            # Rows are ordered by a value that is still arriving; re-sort so the
+            # biggest folder moves to the top as soon as it is known.
+            self._entries = self._sorted_entries()
+            self._pending_size_updates.clear()
+            self._rebuild_table()
+            highlighted = self._highlighted_entry()
+            if highlighted is not None:
+                self._show_details(highlighted)
             return
         table = self._query_base("#file-table", DataTable)
         for key, (entry, _result) in self._pending_size_updates.items():

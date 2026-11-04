@@ -45,23 +45,27 @@ class _TopN:
         # when keeping the largest N, and the largest size when keeping the
         # smallest N. Hence +1 for descending, -1 for ascending.
         self._sign = 1 if descending else -1
-        self._heap: list[tuple[int, str, object]] = []
+        self._heap: list[tuple[int, "_LaterFirst", object]] = []
         self.offered = 0
         self.kept = 0
 
-    def _priority(self, size: int, path: Path) -> tuple[int, str]:
+    def _priority(self, size: int, path: Path) -> tuple[int, "_LaterFirst"]:
         # Smallest priority is evicted first. Descending: smallest size loses;
         # ascending: largest size loses. Ties evict the alphabetically later path.
-        return (self._sign * size, _invert_order(_order_key(path)))
+        key = _order_key(path)
+        return (self._sign * size, _LaterFirst(key))
 
     def offers(self, item: object, size: int, path: Path) -> None:
         self.offered += 1
-        priority = self._priority(size, path)
         if len(self._heap) < self._limit:
-            heapq.heappush(self._heap, (priority[0], priority[1], item))
+            heapq.heappush(self._heap, (*self._priority(size, path), item))
             return
+        # Reject without building a priority: most files are below the cutoff.
+        if self._sign * size < self._heap[0][0]:
+            return
+        priority = self._priority(size, path)
         if priority > self._heap[0][:2]:
-            heapq.heapreplace(self._heap, (priority[0], priority[1], item))
+            heapq.heapreplace(self._heap, (*priority, item))
 
     def results(self, size_of, descending: bool = True) -> list:
         items = sorted(
@@ -75,9 +79,23 @@ class _TopN:
         return items
 
 
-def _invert_order(key: str) -> tuple[int, ...]:
-    """Make ``max``-style heap ordering evict the alphabetically latest path first."""
-    return tuple(-ord(character) for character in key)
+class _LaterFirst(str):
+    """A path key that compares *backwards*.
+
+    The heap evicts its smallest priority, and for equal sizes we want to evict the
+    alphabetically **latest** path (so the ranking keeps earliest-first). Inverting a
+    string character by character allocated a tuple per offered item, which showed
+    up on a 186k-file walk; reversing the comparison costs one string compare and no
+    allocation.
+    """
+
+    __slots__ = ()
+
+    def __lt__(self, other: str) -> bool:  # type: ignore[override]
+        return str.__gt__(self, other)
+
+    def __gt__(self, other: str) -> bool:  # type: ignore[override]
+        return str.__lt__(self, other)
 
 
 class TopFiles(_TopN):
@@ -116,6 +134,10 @@ class Counters:
     errors: list[str] = field(default_factory=list)
     cancelled: bool = False
     max_depth: int = 0
+    #: Directories whose entries came from the cache instead of the filesystem.
+    cache_hits: int = 0
+    #: True when the directory limit cut the walk short.
+    limit_hit: bool = False
 
     def add_file(self, record: FileRecord) -> None:
         self.files += 1

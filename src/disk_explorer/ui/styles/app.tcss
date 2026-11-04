@@ -96,3 +96,14 @@ TabPane {
     color: $error;
     text-style: bold;
 }
+
+#analyzer-visual-scroll {
+    height: 1fr;
+    min-height: 5;
+}
+
+#analyzer-visual-text {
+    width: 100%;
+    height: auto;
+    padding: 0 1;
+}
