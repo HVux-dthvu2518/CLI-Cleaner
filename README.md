@@ -1,32 +1,72 @@
 # Disk Explorer & Cleanup Tool
 
-A performance-first Windows disk explorer built with Python 3.12+ and Textual. The current implementation includes the M0 foundation, a working Explorer for browsing local directories, and the filesystem-engine portion of M1. SQLite caching, analysis, search, and cleanup remain later milestones.
+A performance-first Windows disk explorer built with Python 3.12+, Textual, and a Rust filesystem engine. Python remains the application/UI layer; the Rust extension accelerates directory enumeration and recursive logical-size traversal and releases the GIL while scanning. A pure-Python `os.scandir` implementation remains available for tests and source checkouts without a compiled extension.
 
-## Run from source
+## Windows setup
+
+### Prerequisites
+
+1. Install **Python 3.12+** and **Rust stable** (MSVC toolchain). For example:
+
+   ```powershell
+   winget install --id Rustlang.Rustup -e
+   rustup toolchain install stable-x86_64-pc-windows-msvc
+   rustup default stable-x86_64-pc-windows-msvc
+   rustc --version
+   cargo --version
+   ```
+
+2. Install Visual Studio 2022 Build Tools with **Desktop development with C++** and a Windows SDK. Rust's MSVC target uses these native linker/build tools.
+
+3. From the project directory, create an environment and install the package. PEP 517 invokes Maturin and Cargo to build the Rust extension for the current machine:
+
+   ```powershell
+   py -3.12 -m venv .venv
+   .venv\Scripts\Activate.ps1
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
+   python -m pip install -e ".[dev,screenshots]"
+   python start.py
+   ```
+
+   The `screenshots` extra enables PNG/JPEG export; SVG export does not need it. `.[dev]` installs pytest tooling. The console entry point is also available as `disk-explorer` after installation.
+
+4. Confirm which scanner backend is running: the status line identifies **Rust** when the extension built and loaded, otherwise **Python**. You can check explicitly with:
+
+   ```powershell
+   python -c "from disk_explorer import _rust_scanner; print(_rust_scanner.ENGINE_NAME)"
+   ```
+
+If the native build fails, verify `rustc`, `cargo`, and the MSVC C++ build tools are available in the same terminal, then retry the editable install. Running directly from a source checkout without installing the package uses the Python fallback; install the package to enable the compiled Rust engine.
+
+## Development and tests
 
 ```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev,screenshots]"
-python start.py
+pytest
 ```
 
-The `disk-explorer` console command is also installed by `pip install -e .`. Startup does not depend on the current working directory. Application settings and JSONL logs are written under the user's application data directory (`%LOCALAPPDATA%\DiskExplorerCleaner` on Windows; `$XDG_DATA_HOME/disk-explorer-cleaner` or `~/.local/share/disk-explorer-cleaner` elsewhere).
+For a direct local extension build after dependencies are installed:
 
-## Current foundations
+```powershell
+maturin develop --release
+```
 
-- Textual shell with a live Explorer plus Analyzer, Search, and Cleanup workspaces; use `1`–`4` and `q` to navigate/quit.
-- Browse from the home directory or enter any folder path; use Enter/arrow keys, Backspace, refresh, multi-select, and the details panel.
-- Live listing/status includes folder and file counts, recursive-size progress, volume used/free space, and partial/error information.
-- Screenshot export defaults to PNG; press F2 to configure PNG, SVG, or JPEG and Ctrl+Shift+S to save under the user's data directory. The `screenshots` extra enables raster PNG/JPEG conversion without requiring a system Cairo install.
-- Typed file and scan-result models; unknown folder sizes use `None`.
-- Fast, non-recursive `os.scandir` listing and iterative recursive logical-size scanning.
-- Symlinks and Windows reparse points are not traversed. Directory identity is tracked to avoid duplicate traversal where the filesystem exposes stable inode IDs.
-- Permission, disappearance, and other filesystem errors are recorded; incomplete scans remain explicitly incomplete.
-- `ScanService` runs work in a bounded `ThreadPoolExecutor`, reports child folder sizes incrementally, and supports cooperative cancellation.
-- User-scoped settings and structured JSON Lines logging; no cache database or destructive operations are implemented yet.
+To compare the Rust and Python implementations on a real directory (the script reports warm-cache averages and checks result parity):
 
-## Filesystem engine example
+```powershell
+python scripts/benchmark_scanner.py C:\Users\YourName\Downloads --repeats 3
+```
+
+Benchmark on the target machine and filesystem; speedups depend on storage, permissions, cache state, and workload. Builds are platform-specific; build/install on each target OS/architecture rather than copying a compiled extension between machines.
+
+## Scanner design
+
+- **Fast first stage:** the engine enumerates only immediate children, so the Explorer can render folders and files before recursive folder-size work finishes.
+- **Rust fast path:** Maturin builds `rust/disk_scan` as `disk_explorer._rust_scanner`. PyO3 transfers compact entry/result records and releases Python's GIL for filesystem work, allowing bounded Python worker threads to scan concurrently.
+- **Python fallback:** `src/disk_explorer/core/scanner.py` retains equivalent `os.scandir` traversal when the extension is absent. The public `FileSystemScanner` and `ScanService` contracts remain Python APIs.
+- **Safety/accuracy:** symbolic links and Windows reparse points are not traversed; inaccessible, disappeared, and cancelled work is not reported as a complete scan. Sizes are logical bytes (`st_size`); hard links may be counted more than once.
+- **Bounded concurrency:** `ScanService` caps workers using the configured `max_workers` value and propagates cancellation to either engine.
 
 ```python
 import asyncio
@@ -37,18 +77,17 @@ async def inspect(path: str) -> None:
         print(entry.name, entry.size, result.is_complete)
 
     async with ScanService(max_workers=4) as scans:
-        listing = await scans.enumerate_directory(path)  # quick first stage
-        # Render listing.entries before starting this second stage.
+        listing = await scans.enumerate_directory(path)
+        # Render listing.entries before starting the recursive size stage.
         await scans.calculate_child_sizes(listing.entries, on_update=on_size)
 ```
 
-The callback receives each updated `FileEntry` and its `ScanResult`. Navigating away should cancel the asyncio task; the service then signals its worker to stop at the next traversal checkpoint.
+The callback receives each updated `FileEntry` and its `ScanResult`. Navigating away cancels the asyncio task; the worker checks its cancellation token during traversal.
 
-## Development
+## Application features
 
-```powershell
-python -m pip install -e ".[dev]"
-pytest
-```
-
-The development notes in `AGENTS.md` keep the code lean, filesystem work separate from the UI, and the TUI keyboard-first and responsive. Because this is currently a small, clearly layered package, a generated code knowledge graph would add maintenance rather than useful navigation; the package tree and contracts serve as its map for now.
+- Browse from the home directory or enter a folder path; use Enter, arrows, Backspace, refresh, and multi-select.
+- Live folder/file counts, drive used/free space, size progress, details, and partial/error status.
+- Screenshot export defaults to PNG; press F2 to configure PNG, SVG, or JPEG and Ctrl+Shift+S to save under the user's data directory.
+- Application settings and structured JSONL logs are stored per-user (`%LOCALAPPDATA%\DiskExplorerCleaner` on Windows; `$XDG_DATA_HOME/disk-explorer-cleaner` or `~/.local/share/disk-explorer-cleaner` elsewhere).
+- Analyzer, Search, SQLite caching, and cleanup/deletion are later milestones and are not implemented yet.

@@ -269,7 +269,7 @@ class DiskExplorerApp(App[None]):
         self._listing_partial = False
         self._volume_summary = ""
         self._query_base("#details", Static).update("Select a file or folder to inspect its details.")
-        self._set_status(f"Reading {self.current_path}…")
+        self._set_status(f"Reading with {self.scan_service.engine_name.title()} engine · {self.current_path}…")
         self._query_base("#listing-summary", Static).update("Reading directory…")
         self.run_worker(
             self._load_directory(self.current_path, navigation_id),
@@ -318,7 +318,9 @@ class DiskExplorerApp(App[None]):
         if not listing.is_complete and not self._entries:
             self._set_status(f"Could not read directory · {len(listing.errors)} error(s) · {path}", error=True)
             return
-        self._set_status(f"Listed {len(self._entries)} items · calculating folder sizes · {path}")
+        self._set_status(
+            f"Listed {len(self._entries)} items · {self.scan_service.engine_name.title()} size scan running · {path}"
+        )
         try:
             async def on_size_update(entry: FileEntry, result: ScanResult) -> None:
                 await self._on_size_update(entry, result, navigation_id)
@@ -339,7 +341,11 @@ class DiskExplorerApp(App[None]):
             state = "partial" if self._listing_partial or self._scan_partial or self._scan_errors else "complete"
             suffix = f" · {self._scan_errors} error(s)" if self._scan_errors else ""
             skipped = f" · {self._scan_skipped} link/entry(s) skipped" if self._scan_skipped else ""
-            self._set_status(f"Scan {state}{suffix}{skipped} · {len(self._entries)} items · {self.current_path}", error=state == "partial")
+            self._set_status(
+                f"{self.scan_service.engine_name.title()} scan {state}{suffix}{skipped} · "
+                f"{len(self._entries)} items · {self.current_path}",
+                error=state == "partial",
+            )
 
     async def _on_size_update(self, entry: FileEntry, result: ScanResult, navigation_id: int) -> None:
         if not self._mounted or not self.is_running or navigation_id != self._navigation_id:

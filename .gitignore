@@ -10,3 +10,8 @@ htmlcov/
 *.db
 .idea/
 .vscode/
+target/
+*.so
+*.pyd
+*.dll
+*.dylib

@@ -1,11 +1,13 @@
-"""Launch the application from a source checkout, independent of the working directory."""
+"""Launch the installed package or fall back to this checkout's Python sources."""
 
+from importlib.util import find_spec
 from pathlib import Path
 import sys
 
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "src"))
+if find_spec("disk_explorer") is None:
+    sys.path.insert(0, str(ROOT / "src"))
 
 from disk_explorer.__main__ import main  # noqa: E402
 

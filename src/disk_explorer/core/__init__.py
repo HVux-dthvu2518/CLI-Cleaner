@@ -1,3 +1,3 @@
-from disk_explorer.core.scanner import FileSystemScanner
+from disk_explorer.core.scanner import FileSystemScanner, ScanCancellation
 
-__all__ = ["FileSystemScanner"]
+__all__ = ["FileSystemScanner", "ScanCancellation"]

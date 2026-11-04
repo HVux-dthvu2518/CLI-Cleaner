@@ -1,2 +1,7 @@
+# Python package/build support; Rust extension built by maturin from pyproject.toml.
+maturin>=1.7,<2
 textual>=0.70,<2
 send2trash>=1.8; platform_system == "Windows"
+
+# Optional screenshot raster formats: pip install '.[screenshots]'
+# Development tools: pip install '.[dev]'

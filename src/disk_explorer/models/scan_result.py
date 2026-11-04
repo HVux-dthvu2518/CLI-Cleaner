@@ -14,6 +14,7 @@ class DirectoryListing:
     skipped_entries: int = 0
     errors: list[str] = field(default_factory=list)
     is_complete: bool = True
+    cancelled: bool = False
 
 
 @dataclass(slots=True)
