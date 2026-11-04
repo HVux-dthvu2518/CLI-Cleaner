@@ -246,11 +246,17 @@ def test_partial_or_cancelled_listings_are_not_stored(
 
 @pytest.mark.parametrize(
     "cancelled, is_complete, errors",
-    [(True, True, []), (False, False, []), (False, True, ["C:/x: Access is denied"])],
+    [(True, True, []), (True, False, ["C:/x: partial then cancelled"]), (False, False, [])],
 )
-def test_partial_or_cancelled_sizes_are_not_stored(
+def test_cancelled_or_unexplained_sizes_are_not_stored(
     repository: CacheRepository, tmp_path: Path, cancelled: bool, is_complete: bool, errors: list[str]
 ) -> None:
+    """A cancelled walk, or a "partial" result with no reason, is not a usable row.
+
+    ``is_complete=False`` with no errors would store a number nobody can account
+    for, so it is rejected; a partial result *with* its error list is stored and
+    returned labelled partial (see the test below).
+    """
     result = _size_result(tmp_path)
     result.cancelled = cancelled
     result.is_complete = is_complete
@@ -260,17 +266,52 @@ def test_partial_or_cancelled_sizes_are_not_stored(
     assert repository.counts()["sizes"] == 0
 
 
+def test_partial_size_is_cached_with_its_errors_and_flags(
+    repository: CacheRepository, tmp_path: Path
+) -> None:
+    """A partial total is cached, but never comes back claiming to be complete."""
+    partial = ScanResult(
+        root=tmp_path,
+        total_size=42,
+        total_files=2,
+        total_directories=3,
+        scanned_entries=5,
+        errors=[f"{tmp_path / 'blocked'}: Access is denied"],
+        is_complete=False,
+    )
+
+    assert repository.store_size(partial) is True
+    loaded, validation = repository.load_size(tmp_path, CachePolicy())
+
+    assert validation.is_valid
+    assert loaded is not None
+    assert loaded.total_size == 42  # the useful number is preserved
+    assert loaded.is_complete is False  # ...but never presented as complete
+    assert loaded.errors == [f"{tmp_path / 'blocked'}: Access is denied"]
+
+
 def test_permission_errors_never_become_an_empty_directory(
     service: CacheService, tmp_path: Path
 ) -> None:
-    """An inaccessible directory must stay a miss, not be cached as 'empty'."""
+    """An inaccessible directory must never be cached as a complete empty scan."""
     blocked = tmp_path / "blocked"
     blocked.mkdir()
-    denied = ScanResult(root=blocked, is_complete=False, errors=[f"{blocked}: Permission denied"])
+    denied = ScanResult(
+        root=blocked,
+        total_size=0,
+        total_files=0,
+        is_complete=False,
+        errors=[f"{blocked}: Permission denied"],
+    )
 
-    assert service.store_size(denied) is False
-    assert service.cached_size(blocked) is None
-    assert service.repository.counts()["sizes"] == 0
+    assert service.store_size(denied) is True  # cached, because it says why
+    cached = service.cached_size(blocked)
+
+    assert cached is not None
+    assert cached.is_complete is False  # never a successful zero-byte result
+    assert "Permission denied" in cached.errors[0]
+    assert service.stats.partial_hits == 1
+    assert "partial" in service.stats.summary()
 
 
 # -- invalidation and manual refresh --------------------------------------
@@ -466,3 +507,52 @@ def test_repository_operations_are_safe_when_closed(tmp_path: Path) -> None:
     assert repository.clear() == 0
     with pytest.raises(CacheUnavailable):
         database.fetch_one("SELECT 1")
+
+
+# -- schema migration ------------------------------------------------------
+def test_v1_database_upgrades_and_keeps_its_rows(tmp_path: Path) -> None:
+    """An existing cache from an older build must upgrade, not be thrown away."""
+    from disk_explorer.cache.schema import MIGRATIONS
+
+    database_path = tmp_path / "cache" / "scan.sqlite3"
+    database_path.parent.mkdir(parents=True)
+    connection = sqlite3.connect(database_path)
+    connection.executescript(MIGRATIONS[1])  # build exactly the v1 shape
+    connection.execute("PRAGMA user_version=1")
+    connection.execute(
+        "INSERT INTO sizes (path_key, path, created_at, ttl_seconds, mtime_ns, total_size,"
+        " total_files, total_directories, scanned_entries, skipped_count, skipped)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            path_key(tmp_path),
+            str(tmp_path),
+            time_now(),
+            1800,
+            tmp_path.stat().st_mtime_ns,  # must match, or the row is legitimately stale
+            999,
+            5,
+            3,
+            9,
+            0,
+            "[]",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    database = Database(database_path)
+    assert database.open() is True
+    try:
+        (version,) = database.fetch_one("PRAGMA user_version")
+        assert version == SCHEMA_VERSION
+        row = database.fetch_one(
+            "SELECT total_size, is_complete, errors FROM sizes WHERE path_key = ?",
+            (path_key(tmp_path),),
+        )
+        # v1 rows default to complete with no errors: that is what they meant.
+        assert row == (999, 1, "[]")
+        result, validation = CacheRepository(database).load_size(tmp_path, CachePolicy())
+        assert validation.is_valid and result is not None
+        assert result.total_size == 999 and result.is_complete is True
+    finally:
+        database.close()

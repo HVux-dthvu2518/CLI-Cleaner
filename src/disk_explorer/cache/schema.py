@@ -14,13 +14,19 @@ never be conflated.
 Each row stores ``ttl_seconds``: the TTL in force when it was written. Raising the
 TTL in settings later must not retroactively make an old row trustworthy.
 
-Both tables are versioned through ``PRAGMA user_version``. A row exists only for
-a *complete*, error-free scan; the absence of a row is the cache miss.
+Since v2, a ``sizes`` row may also describe a **partial** scan (``is_complete = 0``)
+with its error list preserved in ``errors``. Only sizes are stored this way: a
+partial listing would hide entries from the Explorer, whereas a partial total is
+useful (and cheap to show) as long as it is labelled partial. Storing it never
+implies completeness - the flags travel with the row into ``ScanResult``.
+
+Both tables are versioned through ``PRAGMA user_version``. A *complete* row exists
+only for a complete, error-free scan; the absence of a row is the cache miss.
 """
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: Connection pragmas, kept here so documentation and behaviour cannot drift.
 PRAGMAS = {
@@ -29,19 +35,7 @@ PRAGMAS = {
     "busy_timeout": 5000,  # A second app instance waits instead of failing.
 }
 
-_TABLES_V1 = """
-CREATE TABLE IF NOT EXISTS listings (
-    path_key      TEXT    PRIMARY KEY,
-    path          TEXT    NOT NULL,
-    created_at    REAL    NOT NULL,
-    ttl_seconds   REAL    NOT NULL DEFAULT 0,
-    mtime_ns      INTEGER,
-    entry_count   INTEGER NOT NULL,
-    skipped_count INTEGER NOT NULL DEFAULT 0,
-    payload       TEXT    NOT NULL,
-    skipped       TEXT    NOT NULL DEFAULT '[]'
-);
-
+_SIZES_V1 = """
 CREATE TABLE IF NOT EXISTS sizes (
     path_key          TEXT    PRIMARY KEY,
     path              TEXT    NOT NULL,
@@ -56,12 +50,37 @@ CREATE TABLE IF NOT EXISTS sizes (
     skipped           TEXT    NOT NULL DEFAULT '[]'
 );
 
-CREATE INDEX IF NOT EXISTS idx_listings_created_at ON listings(created_at);
 CREATE INDEX IF NOT EXISTS idx_sizes_created_at ON sizes(created_at);
 """
 
+_TABLES_V1 = """
+CREATE TABLE IF NOT EXISTS listings (
+    path_key      TEXT    PRIMARY KEY,
+    path          TEXT    NOT NULL,
+    created_at    REAL    NOT NULL,
+    ttl_seconds   REAL    NOT NULL DEFAULT 0,
+    mtime_ns      INTEGER,
+    entry_count   INTEGER NOT NULL,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    payload       TEXT    NOT NULL,
+    skipped       TEXT    NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_listings_created_at ON listings(created_at);
+"""
+
+#: v2 adds partial-size support. ``ALTER TABLE`` keeps existing rows usable.
+_MIGRATION_V2 = """
+ALTER TABLE sizes ADD COLUMN is_complete INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE sizes ADD COLUMN errors TEXT NOT NULL DEFAULT '[]';
+"""
+
 #: ``version -> SQL`` applied in order when the stored version is older.
-MIGRATIONS: dict[int, str] = {1: _TABLES_V1}
+#: v1 must keep producing exactly the original shape so upgrades replay cleanly.
+MIGRATIONS: dict[int, str] = {
+    1: _TABLES_V1 + _SIZES_V1,
+    2: _MIGRATION_V2,
+}
 
 
 def migrations_after(version: int) -> list[tuple[int, str]]:

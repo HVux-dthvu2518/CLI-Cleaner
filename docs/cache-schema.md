@@ -7,7 +7,8 @@ decision below.
 - File: `%LOCALAPPDATA%\DiskExplorerCleaner\cache\scan-cache.sqlite3` on Windows,
   `$XDG_DATA_HOME/disk-explorer-cleaner/cache/scan-cache.sqlite3` elsewhere.
   Override with `cache_path` in `settings.json`.
-- Version: `PRAGMA user_version = 1`, applied by `disk_explorer.cache.schema`.
+- Version: `PRAGMA user_version = 2`, applied by `disk_explorer.cache.schema`
+  (v1 -> v2 adds `is_complete` and `errors` to `sizes`).
 - Pragmas: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`.
   Even in WAL mode, readers and a writer can briefly conflict, so callers retry
   instead of treating a lock as data loss.
@@ -62,24 +63,39 @@ antivirus-scanned storage without adding meaningful latency locally.
 | `scanned_entries` | INTEGER | entries examined |
 | `skipped_count` | INTEGER | skipped entries (links, reparse points, non-regular files) |
 | `skipped` | TEXT | JSON array of `[path, reason]` |
+| `is_complete` | INTEGER | `1` complete, `0` partial (added in v2) |
+| `errors` | TEXT | JSON array of error strings, empty for a complete scan (added in v2) |
 
 Index: `idx_sizes_created_at`. The `created_at` value doubles as a scan epoch: the
 cross-check in `CacheService._first_changed_child` compares only listings written
 at or after it, so a listing from an older scan is never used as evidence.
 
-## What is never stored
+## What is never stored, and what may be partial
 
-A row exists only for a **complete, error-free** result. The following are
-rejected before reaching SQL (see `CacheRepository.store_listing` /
-`store_size`) and counted in `CacheStats.skipped_writes`:
+The invariant is **"a row always carries its own truth"**, not "only perfect scans
+are cached". `is_complete` and `errors` are stored with the row and come back on
+the `ScanResult`, so a reader cannot mistake a partial total for a complete one.
 
-- `cancelled=True` — cooperative cancellation stopped the walk;
-- `is_complete=False` — the walk knows it is partial;
-- `errors` non-empty — including permission denials, which must never be
-  interpreted as "empty directory";
-- root mtime unreadable — `None` is unknown, not "unchanged".
+| Case | `listings` | `sizes` |
+| --- | --- | --- |
+| Complete, no errors | stored | stored (`is_complete=1`) |
+| Partial **with** its error list | rejected | stored (`is_complete=0`, `errors` preserved) |
+| Partial with no errors | rejected | rejected — the number would be unaccountable |
+| Cancelled | rejected | rejected — the walk was abandoned mid-flight |
+| Root mtime unreadable (`None`) | rejected | rejected — `None` is unknown, not "unchanged" |
 
-A cache miss is therefore always safe: the absence of a row means "scan it".
+**Why the asymmetry.** A partial listing would silently hide children from the
+Explorer, and a miss costs one `scandir`. A partial *recursive total* is the
+expensive workload — a 2.2 s walk over a 411k-entry tree where two protected
+folders make the result partial — and re-walking it on every visit helps nobody.
+Labelling it partial keeps the rule that matters: never claim completeness you
+do not have. The v2 schema therefore allows it, and `ScanService` sets
+`ScanStatus.CACHED_PARTIAL` so the UI shows `Cached·part` and the details panel
+says the total excludes unreadable paths.
+
+A display rule keeps the number honest: `scan_service.display_size()` shows a
+partial total only when something was actually measured. A partial scan with no
+measured bytes stays `None` ("unknown"), never `0 B`.
 
 ## Validation
 
@@ -126,10 +142,14 @@ default (30 minutes, `cache_ttl_minutes`).
 version to the SQL that produces it, and `schema.migrations_after(version)`
 returns the ordered steps to apply at `Database.open()`. To add a column:
 
-1. keep `MIGRATIONS[1]` unchanged so existing files still upgrade from v1;
-2. add `MIGRATIONS[2]` with an `ALTER TABLE ... ADD COLUMN ... DEFAULT ...`;
-3. bump `SCHEMA_VERSION` to 2;
-4. add a test that opens a v1 database and asserts the row survives.
+1. never edit an already-released entry (`MIGRATIONS[1]`, `MIGRATIONS[2]`): an
+   existing file must be able to replay them in order;
+2. add the next number (for example `MIGRATIONS[3]`) using
+   `ALTER TABLE ... ADD COLUMN ... DEFAULT ...` where possible;
+3. bump `SCHEMA_VERSION` to match the highest key;
+4. add a test that builds the previous version, upgrades it, and asserts both the
+   `user_version` and the preservation of existing rows (see
+   `test_cache.py::test_v1_database_upgrades_and_keeps_its_rows`).
 
 Rows are disposable, so a migration is allowed to drop the cache contents when a
 destructive change is simpler than an `ALTER` — but it must never require the

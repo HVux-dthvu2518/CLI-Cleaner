@@ -10,6 +10,8 @@ class ScanStatus(str, Enum):
     PARTIAL = "partial"
     ERROR = "error"
     CACHED = "cached"
+    #: Served from the cache, but the cached total is known to be partial.
+    CACHED_PARTIAL = "cached partial"
 
 
 @dataclass(slots=True)

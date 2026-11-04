@@ -15,7 +15,7 @@ from disk_explorer.cache.cache_service import CacheService
 from disk_explorer.cache.database import Database
 from disk_explorer.models.file_entry import ScanStatus
 from disk_explorer.models.scan_result import DirectoryListing, ScanResult
-from disk_explorer.services.scan_service import ScanService
+from disk_explorer.services.scan_service import ScanService, display_size
 
 
 class CountingScanner:
@@ -158,7 +158,10 @@ async def test_cancelled_scan_is_never_cached(tmp_path: Path, cache: CacheServic
 
 
 @pytest.mark.asyncio
-async def test_partial_scan_is_never_cached(tmp_path: Path, cache: CacheService) -> None:
+async def test_partial_scan_is_cached_but_labelled_partial(
+    tmp_path: Path, cache: CacheService
+) -> None:
+    """Partial totals are cached (they are the expensive case) and stay partial."""
     folder = _tree(tmp_path)
 
     class PartialScanner(CountingScanner):
@@ -172,11 +175,49 @@ async def test_partial_scan_is_never_cached(tmp_path: Path, cache: CacheService)
 
     service = ScanService(max_workers=1, scanner=PartialScanner(), cache=cache)
     try:
-        await service.calculate_directory_size(folder)
-        assert cache.cached_size(folder) is None
-        assert cache.stats.skipped_writes == 1
+        fresh = await service.calculate_directory_size(folder)
+        cached = await service.calculate_directory_size(folder)
     finally:
         service.close()
+
+    assert fresh.is_complete is False
+    assert cached is not None
+    assert cached.from_cache is True
+    assert cached.is_complete is False
+    assert cached.total_size == 10
+    assert cached.errors == [f"{folder}: Permission denied"]
+
+
+@pytest.mark.asyncio
+async def test_partial_scan_ui_label_says_cached_partial(tmp_path: Path, cache: CacheService) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _tree(workspace)
+
+    class PartialScanner(CountingScanner):
+        def calculate_size(self, path, cancellation):
+            return ScanResult(
+                root=Path(path),
+                is_complete=False,
+                total_size=30,
+                total_files=2,
+                total_directories=1,
+                scanned_entries=3,
+                errors=[f"{path / 'blocked'}: Access is denied"],
+            )
+
+    service = ScanService(max_workers=1, scanner=PartialScanner(), cache=cache)
+    try:
+        listing = await service.enumerate_directory(workspace)
+        await service.calculate_child_sizes(listing.entries)
+        second = (await service.enumerate_directory(workspace)).entries
+        await service.calculate_child_sizes(second)
+    finally:
+        service.close()
+
+    data_entry = next(entry for entry in second if entry.name == "data")
+    assert data_entry.scan_status is ScanStatus.CACHED_PARTIAL
+    assert data_entry.size == 30
 
 
 @pytest.mark.asyncio
@@ -311,3 +352,30 @@ async def test_child_listing_change_makes_a_size_row_stale(tmp_path: Path, cache
         assert "changed" in cache.stats.last_miss_reason
     finally:
         service.close()
+
+
+@pytest.mark.asyncio
+async def test_unmeasurable_partial_scan_keeps_an_unknown_size(tmp_path: Path) -> None:
+    """A partial scan that measured nothing must not become a misleading "0 B"."""
+    folder = _tree(tmp_path)
+
+    class NothingMeasured(CountingScanner):
+        def calculate_size(self, path, cancellation):
+            return ScanResult(
+                root=Path(path),
+                is_complete=False,
+                total_size=0,
+                scanned_entries=0,
+                errors=[f"{path}: Access is denied"],
+            )
+
+    service = ScanService(max_workers=1, scanner=NothingMeasured())
+    try:
+        result = await service.calculate_directory_size(folder)
+    finally:
+        service.close()
+
+    assert display_size(result) is None
+
+    complete_empty = ScanResult(root=folder, total_size=0, is_complete=True)
+    assert display_size(complete_empty) == 0  # a real empty folder is 0 B
