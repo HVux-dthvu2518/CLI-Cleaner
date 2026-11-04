@@ -14,6 +14,7 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Button, DataTable, Footer, Header, Input, Static, TabbedContent, TabPane
 
+from disk_explorer.analyzer import AnalyzerService
 from disk_explorer.cache.cache_service import CacheService
 from disk_explorer.cache.database import CacheUnavailable, Database
 from disk_explorer.config import (
@@ -30,6 +31,7 @@ from disk_explorer.models.scan_result import ScanResult, SkippedEntry
 from disk_explorer.models.skip_reason import SKIP_REASON_DETAIL, SkipReason
 from disk_explorer.services.scan_service import ScanService
 from disk_explorer.services.screenshot_service import save_screenshot
+from disk_explorer.ui.screens.analyzer_screen import AnalyzerPanel
 from disk_explorer.ui.screens.settings_screen import SettingsScreen
 from disk_explorer.ui.screens.skipped_entries_screen import SkippedEntriesScreen
 
@@ -167,9 +169,11 @@ class DiskExplorerApp(App[None]):
                             with Vertical(id="details-panel"):
                                 yield Static("Select a file or folder to inspect its details.", id="details")
                 with TabPane("2 Analyzer", id="analyzer"):
-                    yield Static(
-                        "[b]Disk Analyzer[/b]\n\nDrive overview, largest folders, files, and extension totals will appear here.",
-                        classes="workspace-copy",
+                    yield AnalyzerPanel(
+                        AnalyzerService(self.scan_service.scanner, self.cache_service),
+                        cache=self.cache_service,
+                        start_path=self.current_path,
+                        id="analyzer-panel",
                     )
                 with TabPane("3 Search", id="search"):
                     yield Static("[b]Search[/b]\n\nSearch by name, extension, size, or directory.", classes="workspace-copy")
@@ -213,6 +217,11 @@ class DiskExplorerApp(App[None]):
         self._mounted = False
         self._navigation_id += 1
         self.scan_service.close()
+
+    def on_analyzer_panel_navigate(self, message: AnalyzerPanel.Navigate) -> None:
+        """Open the Analyzer's chosen folder in the Explorer."""
+        self._query_base("#workspace-tabs", TabbedContent).active = "explorer"
+        self._navigate_to(message.path)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "go-button":

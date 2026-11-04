@@ -216,6 +216,74 @@ The honest summary: the cache buys nothing for a single small local `scandir`
 shows), and a lot for recursive sizes and antivirus-scanned or network storage. It
 is not a substitute for the Rust engine on enumeration cost.
 
+## Disk Analyzer
+
+Press **`2`** for the Analyzer workspace. It answers four questions: which files are
+largest, which folders are largest, which file types consume the most space, and
+how far the scan actually got.
+
+```powershell
+# Analyse a folder (nothing is scanned until you ask)
+#  2        open the Analyzer tab
+#  Analyse  run on the path in the toolbar
+#  Refresh  ignore cached folder sizes (force a real rescan)
+#  Export   write three CSV reports to the user data directory
+#  Sort ↑↓  toggle largest/smallest first
+#  enter    jump to that file's folder (or that folder) in the Explorer
+```
+
+Filters: minimum size in bytes and an extension such as `.mp4` (case-insensitive).
+
+**Nothing is scanned automatically.** The Analyzer starts empty; it never walks a
+drive on open, and it never elevates privileges.
+
+**No double counting.** Folder sizes are recursive totals, so they are *never*
+summed. The analysed total is the sum of file sizes only, which is also why
+`total_size` equals the sum of the largest-files list when no filter is applied.
+
+**Unknown is not zero.** A folder whose size could not be measured shows `—` and
+exports as a blank CSV cell; a partial folder is marked `Partial` and its totals
+exclude unreadable paths. The scan state is always visible: `Complete`, `Partial`,
+`Cancelled` or `Failed`, with skip counts by reason (reparse points, symlinks) and
+unreadable paths listed.
+
+**Bounded work.** The walk is breadth-first with configurable limits
+(`AnalyzerLimits`): 20,000 folders analysed in detail, 40 levels deep. Hitting a
+limit marks the report `Partial` with an explanation instead of silently
+truncating it.
+
+**Reusable models.** `AnalysisSnapshot`, `FileRecord`, `FolderRecord` and
+`ExtensionSummary` are plain data with no Textual or SQLite imports (enforced by a
+test). M4 Search and M5 Cleanup should consume them instead of walking the
+filesystem again.
+
+CSV export writes `disk-analysis-files.csv`, `disk-analysis-folders.csv` and
+`disk-analysis-extensions.csv` as UTF-8 with a BOM (so Excel renders non-ASCII
+paths correctly), and every file ends with a metadata block stating the scan
+status, so an exported partial report cannot be mistaken for a complete one.
+
+### Measured behaviour
+
+`scripts/benchmark_analyzer.py`, Linux sandbox, Python engine, medians:
+
+| Workload | Time | Notes |
+| --- | --- | --- |
+| Cold analysis, 4,000 files / 21 folders | 92.37 ms | empty cache |
+| Warm analysis (cached folder sizes) | 54.80 ms | **1.69×** from the cache |
+| Forced refresh | 93.70 ms | cache bypassed |
+| Cold analysis, `/usr/share` (3,702 files, 1,171 folders) | ~391 ms | 420 symlinks skipped |
+| Warm analysis, `/usr/share` | ~152 ms | **2.57×** from the cache |
+
+Warm runs still enumerate every directory to collect file records - only the
+recursive folder sizes come from the cache. That is deliberate: file-level
+statistics with bounded memory beat a second, unverified quick path. Reproduce on
+Windows:
+
+```powershell
+py scripts/benchmark_analyzer.py --synthetic --files 20000 --folders 40 --repeats 3
+py scripts/benchmark_analyzer.py --path $HOME\Downloads --repeats 3
+```
+
 ## Engine contract
 
 Both engines are reached through `FileSystemScanner` and return the same records, so a missing or broken extension cannot change scan semantics:
@@ -243,4 +311,5 @@ _rust_scanner.calculate_size(path, token, follow_links=False, reparse_mounts=Fal
 - Screenshot export defaults to PNG; press F2 to configure PNG, SVG, or JPEG and Ctrl+Shift+S to save under the user's data directory.
 - Application settings and structured JSONL logs are stored per-user (`%LOCALAPPDATA%\DiskExplorerCleaner` on Windows; `$XDG_DATA_HOME/disk-explorer-cleaner` or `~/.local/share/disk-explorer-cleaner` elsewhere).
 - SQLite hybrid caching is implemented (`src/disk_explorer/cache/`): directory listings and recursive folder sizes are cached separately, validated by metadata + TTL, and invalidated on manual refresh. See [docs/cache-schema.md](docs/cache-schema.md).
-- Analyzer, Search, and cleanup/deletion are later milestones and are not implemented yet.
+- Disk Analyzer is implemented (`src/disk_explorer/analyzer/`): largest files, largest folders, extension statistics, storage overview, filters and CSV export, built on the scanner and the hybrid cache.
+- Search and cleanup/deletion are later milestones and are not implemented yet.
